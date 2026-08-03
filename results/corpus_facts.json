@@ -1,0 +1,32 @@
+{
+  "n_raw_rows": 33246,
+  "n_after_clean_filter": 31303,
+  "n_after_dedup": 25186,
+  "dedup_removed_pct": 19.5,
+  "chars": {
+    "p50": 3481,
+    "p75": 4995,
+    "p90": 6521,
+    "p95": 7567,
+    "max": 19903,
+    "mean": 3800
+  },
+  "cap_coverage_pct": {
+    "4000": 59.7,
+    "6000": 86.1,
+    "8000": 96.3,
+    "10000": 99.2
+  },
+  "strata": {
+    "salary": 9561,
+    "plain": 15312,
+    "deadline": 121,
+    "salary+deadline": 192
+  },
+  "strata_pct": {
+    "salary": 38.0,
+    "plain": 60.8,
+    "deadline": 0.5,
+    "salary+deadline": 0.8
+  }
+}

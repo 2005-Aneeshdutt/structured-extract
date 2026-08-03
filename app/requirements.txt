@@ -1,0 +1,8 @@
+# HuggingFace Space requirements. Deliberately minimal: the Space runs inference
+# only, so no torch, no transformers, no datasets. llama-cpp-python ships a CPU
+# wheel that builds in ~2 min on the free tier; adding torch would push the image
+# past the build timeout for zero benefit.
+gradio>=4.44
+llama-cpp-python>=0.3
+huggingface_hub>=0.24
+pydantic>=2.7

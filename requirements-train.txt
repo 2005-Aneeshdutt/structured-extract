@@ -1,0 +1,17 @@
+# Kaggle T4 training environment ONLY. Do not install locally.
+#
+# WHY a separate file: Kaggle images ship a pinned torch built against a specific
+# CUDA runtime. Installing `torch` from PyPI on top of it silently breaks the
+# driver match and costs a session. So torch is intentionally absent here --
+# train.py asserts the preinstalled version instead of replacing it.
+
+unsloth[cu121-torch230]>=2024.8   # 2x faster + ~50% less VRAM via fused Triton kernels
+trl>=0.9,<0.12                    # SFTTrainer; <0.12 because 0.12 renamed tokenizer->processing_class
+peft>=0.12
+transformers>=4.44
+datasets>=2.20
+bitsandbytes>=0.43
+accelerate>=0.33
+wandb>=0.17
+huggingface_hub>=0.24
+pydantic>=2.7                     # schema.py is vendored into the notebook for label validation

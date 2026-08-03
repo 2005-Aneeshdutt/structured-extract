@@ -1,0 +1,71 @@
+name: CI
+
+# CI here runs everything that does NOT need a GPU, an API key, or a model
+# download: linting, the schema/metric test suite, and an end-to-end dry run of
+# the data pipeline against the deterministic mock teacher. That last one is the
+# valuable part -- it means a refactor that breaks label generation, splitting or
+# SFT formatting fails in CI rather than four days into a Gemini labeling run.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install (CPU-only subset)
+        run: |
+          python -m pip install --upgrade pip
+          # Deliberately NOT `-r requirements.txt`: that pulls torch and
+          # llama-cpp-python, several GB and minutes of build time for code paths
+          # CI cannot exercise without a GPU or a model file.
+          pip install pydantic pandas pyarrow rapidfuzz datasketch ftfy \
+                      numpy matplotlib pytest ruff mypy "datasets>=2.20,<4"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Type-check the schema (the one module everything imports)
+        run: mypy data/schema.py --ignore-missing-imports || true
+
+      - name: Unit tests
+        run: pytest tests/ -q
+
+      - name: Data pipeline smoke test (mock teacher, no API key)
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          python -m data.generate_synthetic \
+            --n 120 --max-corpus-rows 3000 --teacher mock \
+            --out /tmp/labeled.jsonl --cache /tmp/cache.jsonl \
+            --audit-out /tmp/label_audit.md
+          python -m data.prepare_dataset \
+            --in /tmp/labeled.jsonl --out /tmp/processed \
+            --stats-out /tmp/dataset_stats.md \
+            --test-size 20 --val-size 20
+          test -s /tmp/processed/train.jsonl
+          test -s /tmp/processed/test_ids.txt
+          test -s /tmp/processed/fewshot_exemplars.json
+
+      - name: Chart rendering smoke test
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from eval.charts import grouped_bars, save_both_themes
+          save_both_themes(
+              lambda th: grouped_bars(["a", "b"], {"x": [0.4, 0.7], "y": [0.6, 0.8]}, th, title="t"),
+              Path("/tmp/charts"), "smoke")
+          assert (Path("/tmp/charts") / "smoke_light.png").exists()
+          assert (Path("/tmp/charts") / "smoke_dark.png").exists()
+          print("charts OK")
+          PY

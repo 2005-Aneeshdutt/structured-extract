@@ -1,0 +1,43 @@
+# Local machine (RTX 2050 / 4 GB VRAM, WSL Ubuntu, Python 3.11+).
+# Covers: data prep, evaluation, quantization verification, Gradio app.
+# Training deps are deliberately NOT here -- see requirements-train.txt (Kaggle only),
+# because pinning Unsloth/bitsandbytes locally would drag in CUDA builds this box
+# cannot use for training anyway.
+
+# --- core / schema ---
+pydantic>=2.7,<3
+python-dotenv>=1.0
+
+# --- data ---
+datasets>=2.20,<4
+pandas>=2.2
+pyarrow>=16
+rapidfuzz>=3.9          # near-duplicate detection (C++ Levenshtein, ~100x faster than difflib)
+datasketch>=1.6         # MinHashLSH for O(n) near-dup blocking over 30k docs
+ftfy>=6.2               # fixes the mojibake ("Â·", "â€™") that is endemic in scraped postings
+
+# --- teacher / ceiling model (free tier) ---
+google-genai>=1.0       # NOT google-generativeai (deprecated); new unified SDK
+tenacity>=8.3           # backoff for 429s on the free tier
+
+# --- local inference for eval ---
+transformers>=4.44
+accelerate>=0.33
+bitsandbytes>=0.43      # 4-bit NF4 -- the only way a 1.5B + KV cache fits in 4 GB
+peft>=0.12
+torch>=2.3              # install the CUDA build first: see README
+llama-cpp-python>=0.3   # GGUF runtime for quantized eval + CPU Gradio app
+
+# --- eval / reporting ---
+numpy>=1.26
+scipy>=1.13
+matplotlib>=3.9
+tqdm>=4.66
+
+# --- app ---
+gradio>=4.44
+
+# --- dev ---
+ruff>=0.5
+mypy>=1.11
+pytest>=8.3

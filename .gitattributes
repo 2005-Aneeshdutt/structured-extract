@@ -1,0 +1,16 @@
+# Authored on Windows, executed on Linux (Kaggle, HF Spaces, GitHub Actions).
+# Without this, Git checks shell scripts out with CRLF and bash fails with
+# `bad interpreter: /usr/bin/env bash^M` -- a confusing failure to hit at the end
+# of a five-day data run.
+*.sh   text eol=lf
+Makefile text eol=lf
+
+# Notebooks and JSON stay LF so diffs are readable across platforms.
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Binary artifacts: never touch, never diff.
+*.png  binary
+*.gguf binary
+*.safetensors binary

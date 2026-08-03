@@ -1,0 +1,46 @@
+[project]
+name = "structured-extract"
+version = "0.1.0"
+description = "LoRA fine-tuning Qwen2.5-1.5B for schema-constrained JSON extraction from job postings"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = [".venv", "data/raw", "data/interim", "data/processed", "models", "outputs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+  "E501",    # line length is handled by the formatter, not the linter
+  "B008",    # function call in default arg -- argparse/pydantic idiom used throughout
+  "SIM108",  # ternary-instead-of-if often hurts readability in the metric code
+  "RUF012",  # mutable class defaults: pydantic models manage their own
+  # Typographic characters (en dash, middle dot, non-breaking space) are
+  # deliberate: they appear in markdown we emit, in demo inputs that reproduce
+  # real posting text, and in the mojibake/bullet regexes where the *point* is to
+  # match the non-ASCII character.
+  "RUF001", "RUF002", "RUF003",
+  # `class Foo(str, Enum)` rather than `StrEnum`. StrEnum is 3.11+, and this
+  # schema module is vendored into Kaggle/Colab runtimes whose Python version we
+  # do not control. `str, Enum` behaves identically for our use and works
+  # everywhere.
+  "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"training/train.py" = ["E402"]   # imports must follow the sys.path bootstrap
+"app/app.py" = ["E402"]          # same reason: Space vs repo layout bootstrap
+"tests/*" = ["B017", "SIM117"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+ignore_missing_imports = true      # torch/unsloth/llama_cpp ship partial or no stubs
+disallow_untyped_defs = false      # pragmatic: scripts are typed, notebooks-in-py are not
+exclude = "(^|/)(data/(raw|interim|processed)|models|outputs)/"
