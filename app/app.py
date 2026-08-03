@@ -252,7 +252,14 @@ pay will be determined by experience and internal equity.""",
 
 
 def build_ui(default_model: str = "Fine-tuned (LoRA r=16)") -> gr.Blocks:
-    with gr.Blocks(title="Structured Extraction — Qwen2.5-1.5B LoRA", theme=gr.themes.Soft()) as demo:
+    # Deliberately minimal Gradio API surface so the same file runs on 4.x, 5.x
+    # and 6.x. Two things were removed after testing against 6.22:
+    #   * `theme=` on Blocks -- moved to launch() in Gradio 6, and there is no
+    #     spelling that works on both. The default theme is fine.
+    #   * `show_copy_button=` on Textbox -- removed in Gradio 6.
+    # Both were cosmetic; neither is worth a version pin that could leave the
+    # Space and the local install on different majors.
+    with gr.Blocks(title="Structured Extraction — Qwen2.5-1.5B LoRA") as demo:
         gr.Markdown(
             "# Structured JSON extraction from job postings\n"
             "A **1.5B** parameter model, LoRA fine-tuned and quantized to a **1 GB GGUF**, "
@@ -283,7 +290,7 @@ def build_ui(default_model: str = "Fine-tuned (LoRA r=16)") -> gr.Blocks:
                 status = gr.Markdown("Paste a posting and press **Extract**.")
                 output = gr.Code(label="Extracted JSON", language="json", lines=24)
                 with gr.Accordion("Raw model output (before parsing)", open=False):
-                    raw_out = gr.Textbox(label="", lines=8, show_copy_button=True)
+                    raw_out = gr.Textbox(label="", lines=8)
 
         gr.Markdown("### Try one of these — each targets a specific base-model failure mode")
         gr.Examples(

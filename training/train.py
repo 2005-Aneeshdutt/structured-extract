@@ -238,6 +238,47 @@ def assert_environment() -> dict[str, Any]:
     return info
 
 
+def assert_trl_api() -> None:
+    """Fail in 5 seconds if the installed TRL does not match the API used here.
+
+    This script targets TRL 0.9-0.11, where `SFTTrainer` takes `tokenizer`,
+    `max_seq_length` and `data_collator` directly. TRL 0.12 renamed `tokenizer`
+    to `processing_class`; later versions moved `max_seq_length` and
+    `dataset_text_field` into `SFTConfig` and dropped
+    `DataCollatorForCompletionOnlyLM` entirely.
+
+    Without this check a mismatch surfaces as a bare `TypeError: got an
+    unexpected keyword argument` *after* the model has loaded and the dataset
+    has been tokenized -- 15-20 minutes into a Kaggle session, and easy to
+    misread as a data problem. requirements-train.txt and KAGGLE.md both pin
+    `trl<0.12`; this asserts the pin actually took effect.
+    """
+    import inspect
+
+    import trl
+
+    version = getattr(trl, "__version__", "unknown")
+    try:
+        from trl import DataCollatorForCompletionOnlyLM  # noqa: F401
+    except ImportError as e:
+        raise SystemExit(
+            f"trl {version} does not provide DataCollatorForCompletionOnlyLM, which this "
+            "script uses for completion-only loss masking.\n"
+            "Fix:  pip install 'trl>=0.9,<0.12'\n"
+            "(Or port the SFTTrainer call to SFTConfig + assistant_only_loss for newer TRL.)"
+        ) from e
+
+    params = inspect.signature(trl.SFTTrainer.__init__).parameters
+    missing = [p for p in ("tokenizer", "max_seq_length") if p not in params]
+    if missing:
+        raise SystemExit(
+            f"trl {version} SFTTrainer does not accept {missing}. This script targets the "
+            "0.9-0.11 API.\n"
+            "Fix:  pip install 'trl>=0.9,<0.12'"
+        )
+    LOGGER.info("trl %s: SFTTrainer API matches", version)
+
+
 def set_all_seeds(seed: int) -> None:
     """Seed every RNG that touches the run.
 
@@ -495,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg.run_name = f"qwen2.5-1.5b-r{cfg.lora_rank}-a{cfg.lora_alpha}"
 
     env = assert_environment()
+    assert_trl_api()
     if env["supports_bf16"]:
         LOGGER.info("bf16-capable GPU detected -- still using fp16 so results match the T4 reference runs")
     set_all_seeds(cfg.seed)

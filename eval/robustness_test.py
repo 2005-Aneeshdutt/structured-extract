@@ -39,7 +39,7 @@ from typing import Any
 from data.corpus import SALARY_IN_TEXT_RE
 from data.schema import JobPosting, Salary, flatten, parse_prediction, to_target_json
 from eval.metrics import aggregate, score_example
-from eval.run_eval import build_backend, load_fewshot, load_split
+from eval.run_eval import build_backend, generate_completions, load_fewshot, load_split
 
 LOGGER = logging.getLogger("robustness")
 
@@ -260,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gemini-model", default="gemini-2.0-flash")
     ap.add_argument("--unconstrained-gemini", action="store_true")
     ap.add_argument("--fp16", action="store_true")
+    ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--data-dir", type=Path, default=Path("data/processed"))
     ap.add_argument("--split", default="test")
     ap.add_argument("--few-shot", type=int, default=0)
@@ -281,13 +282,12 @@ def main(argv: list[str] | None = None) -> int:
                               "arms": {}}
     for name, rows in suite.items():
         results, preds, golds = [], {}, {}
-        for ex in rows:
-            try:
-                out = backend.generate(ex["source_text"], few_shot)
-            except Exception as e:
-                LOGGER.warning("generation failed: %s", e)
-                out = ""
-            results.append(score_example(ex["posting_id"], ex["source_text"], ex["target_json"], out))
+        # Batched: this suite makes n_per x 10 generations per model, so the
+        # unbatched path would cost more wall clock than the headline evaluation.
+        completions = generate_completions(backend, rows, few_shot, quiet=True)
+        for ex, (out, dt) in zip(rows, completions, strict=True):
+            results.append(score_example(ex["posting_id"], ex["source_text"],
+                                         ex["target_json"], out, latency_s=dt))
             preds[ex["posting_id"]], _ = parse_prediction(out)
             golds[ex["posting_id"]], _ = parse_prediction(ex["target_json"])
         m = aggregate(results, golds, preds)

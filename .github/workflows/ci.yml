@@ -30,7 +30,14 @@ jobs:
           # llama-cpp-python, several GB and minutes of build time for code paths
           # CI cannot exercise without a GPU or a model file.
           pip install pydantic pandas pyarrow rapidfuzz datasketch ftfy \
-                      numpy matplotlib pytest ruff mypy "datasets>=2.20,<4"
+                      numpy matplotlib pytest ruff mypy "datasets>=2.20,<4" \
+                      "gradio>=4.44,<7"
+          # gradio IS installed here (it is pure Python and installs in ~30s)
+          # specifically so tests/test_app.py runs. A Gradio major bump silently
+          # removed Textbox(show_copy_button=) during development, which would
+          # have surfaced as a crashed Space after deploy rather than a red CI
+          # run. llama-cpp-python is still excluded -- it needs a C++ toolchain
+          # and the app's model loading is lazy, so the UI builds without it.
 
       - name: Lint
         run: ruff check .

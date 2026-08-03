@@ -132,34 +132,54 @@ def _rounded_bars(ax: Any, xs: Sequence[float], heights: Sequence[float], width:
     px_per_x = bbox.width / max(x1 - x0, 1e-9)
     px_per_y = bbox.height / max(y1 - y0, 1e-9)
 
-    # strict=True throughout this module: a length mismatch between positions and
-    # values means a bar is silently missing from a results chart, which is worse
-    # than a crash.
+    # FancyBboxPatch applies `rounding_size` in x-data units, and in y it divides
+    # the box height by `mutation_aspect`, rounds, then scales back. So to get a
+    # corner that is CIRCULAR on screen:
+    #
+    #     rounding_size = r_px / px_per_x        (x radius, data units)
+    #     mutation_aspect = px_per_x / px_per_y  (makes the y radius equal in px)
+    #
+    # Getting mutation_aspect inverted does not fail loudly -- it silently
+    # over-rounds until the bar collapses into a pointed lens, which is what an
+    # earlier version of this function produced on the 18-field horizontal chart.
+    aspect = (px_per_x / px_per_y) if px_per_y else 1.0
+
+    # strict=True: a length mismatch between positions and values means a bar is
+    # silently missing from a results chart, which is worse than a crash.
     for x, h in zip(xs, heights, strict=True):
+        length = abs(h)
+        # Radius scales with mark thickness rather than being a literal 4px:
+        # these render at 2000px wide and display at ~800px, so a fixed pixel
+        # radius would be invisible at one size or clumsy at the other. Capped at
+        # half the bar length so short bars stay bars instead of becoming pills.
+        thickness_px = width * (px_per_y if horizontal else px_per_x)
+        length_px = length * (px_per_x if horizontal else px_per_y)
+        r_px = min(0.22 * thickness_px, 0.5 * length_px)
+        rounding = r_px / px_per_x if px_per_x else 0.0
+
         if horizontal:
-            # aspect converts the y-unit radius into an equal-looking x radius
-            aspect = (px_per_y / px_per_x) if px_per_x else 1.0
-            r_y = min(width * 0.22, abs(h) / max(aspect, 1e-9) * 0.5)
+            # Extend past the baseline by the radius, then clip it off: the far
+            # end stays round, the end anchored at zero stays square.
+            overhang = r_px / px_per_x if px_per_x else 0.0
             patch = FancyBboxPatch(
-                (0 - r_y * aspect, x - width / 2), abs(h) + r_y * aspect, width,
-                boxstyle=f"round,pad=0,rounding_size={r_y}",
-                mutation_aspect=1 / aspect if aspect else 1.0,
-                linewidth=0, facecolor=color, clip_on=True, zorder=2,
-            )
-            ax.add_patch(patch)
-            patch.set_clip_path(plt.Rectangle((0, y0), x1, y1 - y0,
-                                              transform=ax.transData, visible=False))
-        else:
-            aspect = (px_per_y / px_per_x) if px_per_x else 1.0
-            r_x = min(width * 0.22, abs(h) / max(aspect, 1e-9) * 0.5)
-            patch = FancyBboxPatch(
-                (x - width / 2, 0 - r_x * aspect), width, abs(h) + r_x * aspect,
-                boxstyle=f"round,pad=0,rounding_size={r_x}",
+                (-overhang, x - width / 2), length + overhang, width,
+                boxstyle=f"round,pad=0,rounding_size={rounding}",
                 mutation_aspect=aspect,
                 linewidth=0, facecolor=color, clip_on=True, zorder=2,
             )
             ax.add_patch(patch)
-            patch.set_clip_path(plt.Rectangle((x0, 0), x1 - x0, y1,
+            patch.set_clip_path(plt.Rectangle((0, y0), x1 - 0, y1 - y0,
+                                              transform=ax.transData, visible=False))
+        else:
+            overhang = r_px / px_per_y if px_per_y else 0.0
+            patch = FancyBboxPatch(
+                (x - width / 2, -overhang), width, length + overhang,
+                boxstyle=f"round,pad=0,rounding_size={rounding}",
+                mutation_aspect=aspect,
+                linewidth=0, facecolor=color, clip_on=True, zorder=2,
+            )
+            ax.add_patch(patch)
+            patch.set_clip_path(plt.Rectangle((x0, 0), x1 - x0, y1 - 0,
                                               transform=ax.transData, visible=False))
 
 

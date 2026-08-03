@@ -21,12 +21,22 @@ google-genai>=1.0       # NOT google-generativeai (deprecated); new unified SDK
 tenacity>=8.3           # backoff for 429s on the free tier
 
 # --- local inference for eval ---
-transformers>=4.44
-accelerate>=0.33
-bitsandbytes>=0.43      # 4-bit NF4 -- the only way a 1.5B + KV cache fits in 4 GB
-peft>=0.12
-torch>=2.3              # install the CUDA build first: see README
-llama-cpp-python>=0.3   # GGUF runtime for quantized eval + CPU Gradio app
+# Upper bounds are not paranoia. An unbounded `transformers>=4.44` resolved to
+# 5.14.1 during development -- a major version the code was not written against.
+# It happened to work, but "reproducible from git clone" cannot rest on that.
+# These ceilings are the versions this repo was actually verified on; raise them
+# deliberately, after re-running `make test` and one eval arm.
+transformers>=4.44,<6      # verified: 5.14.1
+accelerate>=0.33,<2        # verified: 1.x
+bitsandbytes>=0.43,<1      # verified: 0.50.0 -- 4-bit NF4, the only way a 1.5B + KV cache fits in 4 GB
+peft>=0.12,<1              # verified: 0.20.0
+torch>=2.3,<3              # verified: 2.6.0+cu124. Install the CUDA build FIRST -- see README
+
+# llama-cpp-python is NOT installed here. On Windows it fails against the 260-char
+# MAX_PATH limit inside a venv nested under OneDrive, and it wants a C++ toolchain.
+# The GGUF backend and the Gradio app are meant to run under WSL/Linux anyway --
+# see README "Where each stage runs". Install it there:
+#     pip install llama-cpp-python
 
 # --- eval / reporting ---
 numpy>=1.26
@@ -35,7 +45,7 @@ matplotlib>=3.9
 tqdm>=4.66
 
 # --- app ---
-gradio>=4.44
+gradio>=4.44,<7            # verified importable: 6.22.0. app/requirements.txt is what the Space uses.
 
 # --- dev ---
 ruff>=0.5

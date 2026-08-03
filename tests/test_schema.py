@@ -14,14 +14,17 @@ import pytest
 
 from data.schema import (
     FIELD_SPECS,
+    EmploymentType,
     JobPosting,
     Location,
+    RemotePolicy,
     Salary,
     build_messages,
     build_user_prompt,
     canonicalize_terms,
     extract_json_block,
     flatten,
+    gemini_response_schema,
     parse_prediction,
     to_target_json,
     truncate_source,
@@ -134,6 +137,59 @@ class TestPromptContract:
         msgs = build_messages("posting", few_shot=[("src", "{}")])
         assert msgs[1]["content"] == build_user_prompt("src")
         assert msgs[3]["content"] == build_user_prompt("posting")
+
+
+class TestGeminiResponseSchema:
+    """Structural checks on the constrained-decoding schema.
+
+    Worth pinning because the failure mode is expensive and delayed: a malformed
+    schema is rejected by the API on the first call, which is discovered only
+    after starting a labeling run that is metered against a 1,500/day quota.
+    Gemini's structured-output subset rejects `$ref`, `$defs` and `anyOf` -- all
+    of which pydantic's `model_json_schema()` emits for optional and nested
+    types, which is exactly why this schema is hand-built.
+    """
+
+    @staticmethod
+    def _walk(node):
+        yield node
+        if isinstance(node, dict):
+            for v in node.values():
+                yield from TestGeminiResponseSchema._walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                yield from TestGeminiResponseSchema._walk(v)
+
+    def test_no_unsupported_json_schema_keywords(self):
+        banned = {"$ref", "$defs", "anyOf", "oneOf", "allOf", "definitions"}
+        for node in self._walk(gemini_response_schema()):
+            if isinstance(node, dict):
+                assert not (banned & set(node)), f"unsupported keyword in {list(node)}"
+
+    def test_covers_every_top_level_field(self):
+        schema = gemini_response_schema()
+        assert set(schema["properties"]) == set(JobPosting.model_fields)
+        assert set(schema["required"]) == set(JobPosting.model_fields)
+
+    def test_nested_objects_declare_their_leaves(self):
+        props = gemini_response_schema()["properties"]
+        assert set(props["location"]["properties"]) == {"city", "region", "country", "remote_policy"}
+        assert set(props["salary"]["properties"]) == {"min_amount", "max_amount", "currency", "period"}
+
+    def test_enums_match_the_pydantic_models(self):
+        props = gemini_response_schema()["properties"]
+        assert set(props["employment_type"]["enum"]) == {m.value for m in EmploymentType}
+        assert set(props["location"]["properties"]["remote_policy"]["enum"]) == {
+            m.value for m in RemotePolicy}
+
+    def test_property_ordering_matches_canonical_field_order(self):
+        # propertyOrdering pins generation order so self-consistency samples are
+        # byte-comparable rather than differing only in key order.
+        assert gemini_response_schema()["propertyOrdering"] == list(JobPosting.model_fields)
+
+    def test_is_json_serializable(self):
+        # It is sent over the wire; a stray enum or tuple would fail at call time.
+        json.dumps(gemini_response_schema())
 
 
 class TestGrounding:

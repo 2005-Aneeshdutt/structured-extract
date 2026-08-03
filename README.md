@@ -232,6 +232,35 @@ Zero API calls, zero human labeling. → [`results/robustness.md`](results/)
 
 ---
 
+## Where each stage runs
+
+Not every stage runs in the same place, and the reasons are concrete rather than
+stylistic:
+
+| Stage | Runs on | Why not elsewhere |
+|---|---|---|
+| Data prep, teacher labeling | any Python 3.11+ (Windows or Linux) | pure CPU + network |
+| Training, merge, GGUF quantize | **Kaggle T4** | free GPU; and merging peaks near 7 GB RAM, above what WSL2 gets by default on a 16 GB machine |
+| Evaluation (HF 4-bit backend) | local GPU, ≥4 GB | 4-bit NF4 keeps a 1.5B + KV cache under 4 GB |
+| GGUF backend, Gradio app | **WSL / Linux** | see below |
+
+**`llama-cpp-python` does not install into a Windows venv nested under
+OneDrive.** It fails on the 260-character `MAX_PATH` limit — the venv path is
+already 59 characters before `site-packages`, and the package's nested asset
+paths overrun what's left. Two ways out:
+
+```bash
+# preferred: run the GGUF backend and the app under WSL
+wsl -d Ubuntu
+sudo apt install -y python3-pip && pip install llama-cpp-python gradio
+
+# or enable Windows long paths (admin, requires reboot)
+# HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled = 1
+```
+
+Everything else — data prep, the HF eval backend, charts, tests — works fine on
+Windows and was developed there.
+
 ## Reproduce from scratch
 
 ```bash

@@ -46,12 +46,23 @@ PRETTY = {
 
 
 def load_run(spec: str) -> tuple[str, dict[str, Any]]:
-    """Parse a `Label=path.json` CLI argument."""
+    """Parse a `Label=path.json` CLI argument.
+
+    Splits on the LAST `=`, not the first. Ablation labels naturally contain one
+    ("r=8=results/val_r8.json"), and splitting on the first `=` silently yields
+    label "r" and path "8=results/val_r8.json" -- a FileNotFoundError pointing at
+    a path the user never typed. Paths, by contrast, essentially never contain
+    `=`, so last-wins is the right rule.
+    """
     if "=" not in spec:
         raise SystemExit(f"--run needs LABEL=PATH, got {spec!r}")
-    label, path = spec.split("=", 1)
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    return label.strip(), payload
+    label, path = spec.rsplit("=", 1)
+    if not label.strip():
+        raise SystemExit(f"--run needs a non-empty label before '=', got {spec!r}")
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"prediction file not found: {p} (parsed from {spec!r})")
+    return label.strip(), json.loads(p.read_text(encoding="utf-8"))
 
 
 def _rehydrate(payload: dict[str, Any]) -> tuple[list[ExampleResult], dict[str, Any], dict[str, Any]]:

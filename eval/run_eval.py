@@ -291,6 +291,55 @@ def build_backend(args: argparse.Namespace) -> Backend:
     raise SystemExit(f"unknown backend {args.backend}")
 
 
+def generate_completions(
+    backend: Backend,
+    examples: list[dict[str, Any]],
+    few_shot: list[tuple[str, str]] | None = None,
+    *,
+    quiet: bool = False,
+) -> list[tuple[str, float]]:
+    """Generate one completion per example, batched and length-sorted.
+
+    Returns [(completion, amortized_seconds), ...] in the SAME order as
+    `examples`. Shared by run_eval and robustness_test -- the robustness suite
+    makes ~1,000 generations per model, so running it unbatched would cost more
+    wall clock than the entire headline evaluation.
+    """
+    batch_size = getattr(backend, "batch_size", 1) if hasattr(backend, BATCH_CAPABLE) else 1
+    if batch_size > 1 and not quiet:
+        LOGGER.info("batched generation, batch_size=%d — reported latency is amortized "
+                    "per-example throughput, NOT single-request latency", batch_size)
+
+    # Length-sorted batching. Padding is to the longest member of each batch, so a
+    # mixed batch wastes compute on padding AND spikes KV-cache memory to the
+    # worst case. Grouping similar lengths cuts both; results are restored to the
+    # original order afterwards so scoring and the saved prediction file keep
+    # dataset order.
+    order = sorted(range(len(examples)), key=lambda i: len(examples[i]["source_text"]))
+    outs_by_index: dict[int, tuple[str, float]] = {}
+    for start in range(0, len(order), batch_size):
+        idxs = order[start : start + batch_size]
+        chunk = [examples[i] for i in idxs]
+        t0 = time.perf_counter()
+        try:
+            if batch_size > 1:
+                texts = backend.generate_batch([e["source_text"] for e in chunk], few_shot)
+            else:
+                texts = [backend.generate(chunk[0]["source_text"], few_shot)]
+        except Exception as e:
+            # A backend error is scored as empty completions rather than skipped.
+            # A model whose API times out is not thereby more accurate, and
+            # dropping its failures would flatter it.
+            LOGGER.warning("generation failed near %s: %s", chunk[0]["posting_id"], e)
+            texts = [""] * len(chunk)
+        dt = (time.perf_counter() - t0) / max(len(chunk), 1)
+        for i, text in zip(idxs, texts, strict=True):
+            outs_by_index[i] = (text, dt)
+        if not quiet:
+            LOGGER.info("%d/%d | %.1fs/example", min(start + batch_size, len(order)), len(order), dt)
+    return [outs_by_index[i] for i in range(len(examples))]
+
+
 def run(backend: Backend, examples: list[dict[str, Any]], few_shot: list[tuple[str, str]],
         limit: int | None = None) -> dict[str, Any]:
     """Generate + score. Returns a payload safe to cache to disk and re-score."""
@@ -302,42 +351,8 @@ def run(backend: Backend, examples: list[dict[str, Any]], few_shot: list[tuple[s
     golds: dict[str, Any] = {}
     raw_rows: list[dict[str, Any]] = []
 
-    batch_size = getattr(backend, "batch_size", 1) if hasattr(backend, BATCH_CAPABLE) else 1
-    if batch_size > 1:
-        LOGGER.info("batched generation, batch_size=%d — reported latency is amortized "
-                    "per-example throughput, NOT single-request latency", batch_size)
-
-    def _generate_all() -> list[tuple[str, float]]:
-        # Length-sorted batching. Padding is to the longest member of each batch,
-        # so a mixed batch wastes compute on padding AND spikes KV-cache memory to
-        # the worst case. Grouping similar lengths cuts both; results are restored
-        # to the original order afterwards so scoring and the saved prediction file
-        # keep dataset order.
-        order = sorted(range(len(examples)), key=lambda i: len(examples[i]["source_text"]))
-        outs_by_index: dict[int, tuple[str, float]] = {}
-        for start in range(0, len(order), batch_size):
-            idxs = order[start : start + batch_size]
-            chunk = [examples[i] for i in idxs]
-            t0 = time.perf_counter()
-            try:
-                if batch_size > 1:
-                    texts = backend.generate_batch([e["source_text"] for e in chunk], few_shot)
-                else:
-                    texts = [backend.generate(chunk[0]["source_text"], few_shot)]
-            except Exception as e:
-                # A backend error is scored as empty completions rather than
-                # skipped. A model whose API times out is not thereby more
-                # accurate, and dropping its failures would flatter it.
-                LOGGER.warning("generation failed near %s: %s", chunk[0]["posting_id"], e)
-                texts = [""] * len(chunk)
-            dt = (time.perf_counter() - t0) / max(len(chunk), 1)
-            for i, text in zip(idxs, texts, strict=True):
-                outs_by_index[i] = (text, dt)
-            done = min(start + batch_size, len(order))
-            LOGGER.info("%d/%d | %.1fs/example", done, len(order), dt)
-        return [outs_by_index[i] for i in range(len(examples))]
-
-    for i, (ex, (out, dt)) in enumerate(zip(examples, _generate_all(), strict=True), 1):
+    completions = generate_completions(backend, examples, few_shot)
+    for i, (ex, (out, dt)) in enumerate(zip(examples, completions, strict=True), 1):
         res = score_example(ex["posting_id"], ex["source_text"], ex["target_json"], out, latency_s=dt)
         results.append(res)
         pred, _ = parse_prediction(out)
