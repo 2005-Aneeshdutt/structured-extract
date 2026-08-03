@@ -68,6 +68,17 @@ class Backend(Protocol):
     def generate(self, source_text: str, few_shot: list[tuple[str, str]] | None) -> str: ...
 
 
+#: Backends may optionally expose `generate_batch`. `run()` uses it when present.
+#:
+#: This is not a micro-optimization. Measured on the author's RTX 2050, 4-bit
+#: single-stream generation runs ~41 s/example: 500 test examples x 4 arms is
+#: ~17 GPU-hours, and the robustness suite would add ~22 more. That is the
+#: difference between an evaluation you run and one you keep postponing.
+#: Batching amortizes the per-step kernel-launch and NF4 dequantization overhead,
+#: which is what actually dominates at batch size 1.
+BATCH_CAPABLE = "generate_batch"
+
+
 # ---------------------------------------------------------------------------
 # Local transformers backend (base + LoRA adapter, 4-bit)
 # ---------------------------------------------------------------------------
@@ -84,11 +95,12 @@ class HFBackend:
     """
 
     def __init__(self, adapter: str | None = None, model_id: str = BASE_MODEL,
-                 load_in_4bit: bool = True) -> None:
+                 load_in_4bit: bool = True, batch_size: int = 8) -> None:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
         self.name = f"hf:{Path(adapter).name if adapter else 'base'}"
+        self.batch_size = batch_size
         quant = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -110,14 +122,28 @@ class HFBackend:
         self.model.eval()
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        # LEFT padding is mandatory for batched decoder-only generation. With
+        # right padding, shorter prompts end in pad tokens and the model
+        # continues from padding rather than from the prompt -- it produces
+        # fluent garbage, and nothing in the output reveals the cause. This one
+        # line is the difference between a correct batched eval and a silently
+        # wrong one.
+        self.tokenizer.padding_side = "left"
 
-    def generate(self, source_text: str, few_shot: list[tuple[str, str]] | None = None) -> str:
-        import torch
-
-        prompt = self.tokenizer.apply_chat_template(
+    def _render(self, source_text: str, few_shot: list[tuple[str, str]] | None) -> str:
+        return self.tokenizer.apply_chat_template(
             build_messages(source_text, few_shot), tokenize=False, add_generation_prompt=True
         )
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+
+    def generate(self, source_text: str, few_shot: list[tuple[str, str]] | None = None) -> str:
+        return self.generate_batch([source_text], few_shot)[0]
+
+    def generate_batch(self, source_texts: list[str],
+                       few_shot: list[tuple[str, str]] | None = None) -> list[str]:
+        import torch
+
+        prompts = [self._render(t, few_shot) for t in source_texts]
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.model.device)
         with torch.no_grad():
             out = self.model.generate(
                 **inputs,
@@ -125,7 +151,10 @@ class HFBackend:
                 do_sample=False,  # greedy -- eval must be reproducible run to run
                 pad_token_id=self.tokenizer.pad_token_id,
             )
-        return self.tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        # With left padding every sequence's completion starts at the same
+        # offset, so a single slice is correct for the whole batch.
+        gen = out[:, inputs["input_ids"].shape[1]:]
+        return self.tokenizer.batch_decode(gen, skip_special_tokens=True)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +280,8 @@ def load_fewshot(processed_dir: Path, k: int) -> list[tuple[str, str]]:
 
 def build_backend(args: argparse.Namespace) -> Backend:
     if args.backend == "hf":
-        return HFBackend(adapter=args.adapter, model_id=args.base_model, load_in_4bit=not args.fp16)
+        return HFBackend(adapter=args.adapter, model_id=args.base_model,
+                         load_in_4bit=not args.fp16, batch_size=args.batch_size)
     if args.backend == "gguf":
         if not args.gguf:
             raise SystemExit("--gguf PATH is required for the gguf backend")
@@ -272,17 +302,42 @@ def run(backend: Backend, examples: list[dict[str, Any]], few_shot: list[tuple[s
     golds: dict[str, Any] = {}
     raw_rows: list[dict[str, Any]] = []
 
-    for i, ex in enumerate(examples, 1):
-        t0 = time.perf_counter()
-        try:
-            out = backend.generate(ex["source_text"], few_shot)
-        except Exception as e:
-            # A backend error is scored as an empty completion rather than
-            # skipped. A model whose API times out is not thereby more accurate.
-            LOGGER.warning("generation failed for %s: %s", ex["posting_id"], e)
-            out = ""
-        dt = time.perf_counter() - t0
+    batch_size = getattr(backend, "batch_size", 1) if hasattr(backend, BATCH_CAPABLE) else 1
+    if batch_size > 1:
+        LOGGER.info("batched generation, batch_size=%d — reported latency is amortized "
+                    "per-example throughput, NOT single-request latency", batch_size)
 
+    def _generate_all() -> list[tuple[str, float]]:
+        # Length-sorted batching. Padding is to the longest member of each batch,
+        # so a mixed batch wastes compute on padding AND spikes KV-cache memory to
+        # the worst case. Grouping similar lengths cuts both; results are restored
+        # to the original order afterwards so scoring and the saved prediction file
+        # keep dataset order.
+        order = sorted(range(len(examples)), key=lambda i: len(examples[i]["source_text"]))
+        outs_by_index: dict[int, tuple[str, float]] = {}
+        for start in range(0, len(order), batch_size):
+            idxs = order[start : start + batch_size]
+            chunk = [examples[i] for i in idxs]
+            t0 = time.perf_counter()
+            try:
+                if batch_size > 1:
+                    texts = backend.generate_batch([e["source_text"] for e in chunk], few_shot)
+                else:
+                    texts = [backend.generate(chunk[0]["source_text"], few_shot)]
+            except Exception as e:
+                # A backend error is scored as empty completions rather than
+                # skipped. A model whose API times out is not thereby more
+                # accurate, and dropping its failures would flatter it.
+                LOGGER.warning("generation failed near %s: %s", chunk[0]["posting_id"], e)
+                texts = [""] * len(chunk)
+            dt = (time.perf_counter() - t0) / max(len(chunk), 1)
+            for i, text in zip(idxs, texts, strict=True):
+                outs_by_index[i] = (text, dt)
+            done = min(start + batch_size, len(order))
+            LOGGER.info("%d/%d | %.1fs/example", done, len(order), dt)
+        return [outs_by_index[i] for i in range(len(examples))]
+
+    for i, (ex, (out, dt)) in enumerate(zip(examples, _generate_all(), strict=True), 1):
         res = score_example(ex["posting_id"], ex["source_text"], ex["target_json"], out, latency_s=dt)
         results.append(res)
         pred, _ = parse_prediction(out)
@@ -302,8 +357,8 @@ def run(backend: Backend, examples: list[dict[str, Any]], few_shot: list[tuple[s
             "exact_match": res.exact_match,
             "ungrounded": res.ungrounded,
         })
-        if i % 25 == 0:
-            LOGGER.info("%d/%d | compliance so far %.1f%%", i, len(examples),
+        if i % 50 == 0:
+            LOGGER.info("scored %d/%d | compliance so far %.1f%%", i, len(examples),
                         100 * sum(r.lenient_compliant for r in results) / len(results))
 
     metrics = aggregate(results, golds, preds)
@@ -329,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--unconstrained-gemini", action="store_true",
                     help="disable Gemini's response_schema for the apples-to-apples row")
     ap.add_argument("--fp16", action="store_true", help="load fp16 instead of 4-bit (needs >6 GB VRAM)")
+    ap.add_argument("--batch-size", type=int, default=8,
+                    help="hf backend only. 8 fits a 4 GB card at seq 2048; drop to 4 if you OOM")
     ap.add_argument("--data-dir", type=Path, default=Path("data/processed"))
     ap.add_argument("--split", default="test", choices=["train", "val", "test"])
     ap.add_argument("--few-shot", type=int, default=0)

@@ -293,6 +293,16 @@ make compare report              # writes results/*.md and results/charts/*.png
 make verify                      # GGUF vs fp16-adapter regression check
 ```
 
+Generation is batched with length-sorted bucketing. Measured on an RTX 2050
+(4 GB): **41 s/example unbatched → 7.7 s at batch 8 → 6.1 s at batch 16**, which
+is the difference between ~17 GPU-hours for the full evaluation and ~3. Batch 8
+is the default because it leaves headroom for a batch of unusually long
+postings; `--batch-size 16` measured fine on 4 GB and is worth trying.
+
+Left padding is set explicitly for batched decoding — with right padding a
+decoder-only model continues from pad tokens and emits fluent nonsense, with
+nothing in the output to reveal why.
+
 **4 · Ship**:
 
 ```bash
