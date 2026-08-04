@@ -232,6 +232,61 @@ class TestVoting:
         assert voted is None and agreement == {}
 
 
+class TestSetValuedVoting:
+    """List fields are voted per ELEMENT, not as atomic values.
+
+    Atomic voting made agreement a function of list length rather than of
+    teacher reliability: on the first 500 real gold postings, `required_skills`
+    averaged 0.59 agreement -- under the 0.67 gate -- on records that were
+    accepted anyway, and list fields drove 87%/68%/43% of all low-agreement
+    rejections.
+    """
+
+    def _with(self, skills: list[str]) -> JobPosting:
+        return JobPosting(job_title="Engineer", required_skills=skills)
+
+    def test_one_extra_item_does_not_destroy_agreement(self):
+        """The exact shape that was tanking the yield."""
+        samples = [self._with(["python", "sql"]),
+                   self._with(["python", "sql"]),
+                   self._with(["git", "python", "sql"])]
+        voted, agreement = vote(samples)
+        assert voted is not None
+        assert voted.required_skills == ["python", "sql"], "minority item must not carry"
+        assert agreement["required_skills"] > 0.67, "must clear the gate"
+
+    def test_unanimous_lists_score_one(self):
+        _v, agreement = vote([self._with(["python", "sql"])] * 3)
+        assert agreement["required_skills"] == 1.0
+
+    def test_unanimously_empty_is_agreement_not_absence(self):
+        _v, agreement = vote([self._with([])] * 3)
+        assert agreement["required_skills"] == 1.0
+
+    def test_disjoint_lists_fail_the_gate(self):
+        """Genuine disagreement must still be caught."""
+        samples = [self._with(["python"]), self._with(["java"]), self._with(["go"])]
+        voted, agreement = vote(samples)
+        assert agreement["required_skills"] < 0.67
+        assert voted is not None and voted.required_skills == [], \
+            "nothing reaches a strict majority, so nothing survives"
+
+    def test_item_in_exactly_half_is_dropped(self):
+        """Contested items are dropped, not coin-flipped, for a held-out set."""
+        samples = [self._with(["python", "sql"]), self._with(["python"])]
+        voted, _a = vote(samples)
+        assert voted is not None and voted.required_skills == ["python"]
+
+    def test_scalar_fields_are_unaffected(self):
+        """The dispatch must not change how non-list fields vote."""
+        samples = [JobPosting(job_title="A", years_experience_min=5),
+                   JobPosting(job_title="A", years_experience_min=5),
+                   JobPosting(job_title="A", years_experience_min=3)]
+        voted, agreement = vote(samples)
+        assert voted is not None and voted.years_experience_min == 5
+        assert agreement["years_experience_min"] == 2 / 3
+
+
 class TestLabelFunnel:
     def test_low_agreement_examples_are_rejected_not_repaired(self):
         """A contested example must be dropped, never averaged into agreement."""

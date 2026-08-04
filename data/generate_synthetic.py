@@ -502,8 +502,62 @@ grounding_failures = ungrounded_fields
 # ===========================================================================
 
 
+def _vote_set(values: list[list[Any]]) -> tuple[list[Any], float]:
+    """Per-ELEMENT majority vote over a list-valued field.
+
+    Why list fields cannot be voted atomically
+    ------------------------------------------
+    `required_skills`, `preferred_skills` and `benefits` hold ~5-15 items. Voting
+    the whole list as one value asks three independent samples to agree on every
+    element simultaneously, and the probability of that decays geometrically in
+    list length: three samples that produce ["python","sql"], ["python","sql"] and
+    ["git","python","sql"] register as *total* disagreement over one marginal
+    skill.
+
+    Measured on the first 500 gold postings under atomic voting: mean agreement
+    for `required_skills` was 0.59 -- BELOW the 0.67 gate -- on the records that
+    were nonetheless accepted. A field that fails its own gate on accepted
+    records is not measuring teacher reliability, it is measuring list length.
+    List fields drove 87% / 68% / 43% of all low-agreement rejections.
+
+    It was also internally inconsistent: `canonicalize_terms` already documents
+    that "the metric scores these fields as sets", and `eval/metrics.py` does
+    exactly that. Only the vote treated them as atomic. Now both agree.
+
+    Agreement is the mean support of each element over the union, which is the
+    direct set analogue of the scalar case (there, agreement is the fraction of
+    samples backing the winner). Unanimous lists score 1.0; one extra item in one
+    of three samples costs a little, not everything.
+    """
+    support: Counter[str] = Counter()
+    for v in values:
+        # dedupe within a sample so a repeated item cannot manufacture support
+        for item in {json.dumps(x, sort_keys=True, default=str) for x in (v or [])}:
+            support[item] += 1
+
+    k = len(values)
+    if not support:
+        # Every sample said "no items". That is unanimity, not absence of signal.
+        return [], 1.0
+
+    # Strict majority: an item present in exactly half the samples is contested,
+    # and for the held-out set we prefer to drop it rather than coin-flip it in.
+    winners = sorted(item for item, c in support.items() if c / k > 0.5)
+    agreement = sum(support[item] / k for item in support) / len(support)
+    return [json.loads(w) for w in winners], agreement
+
+
 def _vote_value(values: list[Any]) -> tuple[Any, float]:
-    """Majority vote over one leaf field; returns (winner, agreement in [0,1])."""
+    """Majority vote over one leaf field; returns (winner, agreement in [0,1]).
+
+    Dispatches to `_vote_set` when the field holds a list, because set-valued and
+    scalar fields need different notions of "the samples agreed".
+    """
+    if any(isinstance(v, list) for v in values):
+        # A field is list-valued if ANY sample emitted a list; a sample that
+        # emitted null for a list field counts as the empty set, not as a
+        # competing scalar.
+        return _vote_set([v if isinstance(v, list) else [] for v in values])
     keyed = [json.dumps(v, sort_keys=True, default=str) for v in values]
     top, count = Counter(keyed).most_common(1)[0]
     return json.loads(top), count / len(keyed)
