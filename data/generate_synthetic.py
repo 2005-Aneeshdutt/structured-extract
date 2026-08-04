@@ -149,8 +149,23 @@ class ResponseCache:
         self._fh = self.path.open("a", encoding="utf-8")
 
     @staticmethod
-    def key(model: str, temperature: float, prompt: str) -> str:
-        return hashlib.sha1(f"{model}|{temperature:.2f}|{prompt}".encode()).hexdigest()
+    def key(model: str, temperature: float, prompt: str, sample_idx: int = 0) -> str:
+        """Cache key. `sample_idx` is load-bearing, not cosmetic.
+
+        Self-consistency draws k samples at the SAME temperature, and the whole
+        point is that they may differ. Without the index in the key, samples 2..k
+        collide on (model, temperature, prompt) and every one after the first is
+        served from cache as a byte-identical copy.
+
+        The vote then sees k-1 identical objects plus one greedy sample, so the
+        duplicated value wins the majority by construction and disagreement
+        becomes unobservable -- the exact signal the protocol exists to measure.
+        Per-field agreement would read 2/3 on genuinely contested fields and pass
+        the 0.67 gate, making the gold set look verified when it is not.
+        """
+        return hashlib.sha1(
+            f"{model}|{temperature:.2f}|{sample_idx}|{prompt}".encode()
+        ).hexdigest()
 
     def get(self, k: str) -> str | None:
         return self._mem.get(k)
@@ -192,12 +207,12 @@ class GeminiTeacher:
         self.budget = budget or Budget()
         self._schema = gemini_response_schema()
 
-    def __call__(self, posting_text: str, temperature: float = 0.0) -> str:
+    def __call__(self, posting_text: str, temperature: float = 0.0, sample_idx: int = 0) -> str:
         from google.genai import types
         from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
         prompt = build_user_prompt(posting_text)
-        ck = ResponseCache.key(self.model, temperature, prompt)
+        ck = ResponseCache.key(self.model, temperature, prompt, sample_idx)
         if self.cache and (hit := self.cache.get(ck)) is not None:
             return hit
 
@@ -244,7 +259,7 @@ _YEARS_RE = re.compile(r"(\d{1,2})\s*\+?\s*(?:-|to|–)?\s*(?:\d{1,2})?\s*years?
 _SKILL_VOCAB = ["python", "java", "javascript", "typescript", "sql", "excel", "aws", "azure", "react", "node.js", "docker", "kubernetes", "git", "linux", "c#", "c++", "go", "rust", "scala", "spark", "hadoop", "tableau", "power", "bi", "salesforce", "sap", "communication", "leadership", "project", "management"]
 
 
-def mock_teacher(posting_text: str, temperature: float = 0.0) -> str:
+def mock_teacher(posting_text: str, temperature: float = 0.0, sample_idx: int = 0) -> str:
     """Deterministic regex 'teacher' for offline testing.
 
     NOT used for real labels -- its outputs are far too crude. It exists so that
@@ -466,7 +481,13 @@ def label_posting(
     """
     base = {"posting_id": posting.posting_id, "source_text": posting.text, "platform": posting.platform}
 
-    raws = [teacher(posting.text, temperature=temperature if i else 0.0) for i in range(n_samples)]
+    # Sample 0 is greedy; samples 1..k-1 share a temperature but are distinct
+    # draws, so each carries its own sample_idx to keep the cache from collapsing
+    # them into one repeated answer. See ResponseCache.key.
+    raws = [
+        teacher(posting.text, temperature=temperature if i else 0.0, sample_idx=i)
+        for i in range(n_samples)
+    ]
     parsed: list[JobPosting] = []
     for raw in raws:
         obj, _err = parse_prediction(raw)
