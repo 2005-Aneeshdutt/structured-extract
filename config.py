@@ -66,6 +66,41 @@ def load_project_env(path: Path | None = None) -> bool:
     return True
 
 
+#: Third-party loggers that emit one INFO line per HTTP request. On a run that
+#: downloads a dataset and then makes thousands of API calls, these bury the
+#: lines that matter (label yield, budget exhaustion) under hundreds of
+#: `HTTP Request: HEAD ... 404` entries -- and the 404s are just `datasets`
+#: probing for optional files, which reads as failure to anyone watching.
+_NOISY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "urllib3",
+    "filelock",
+    "fsspec",
+    "huggingface_hub.utils._http",
+    "google_genai.models",
+)
+
+
+def quiet_third_party_logs(level: int = logging.WARNING) -> None:
+    """Raise the log level of chatty dependencies. Our own loggers are untouched."""
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
+
+def setup_run(*, quiet_deps: bool = True) -> None:
+    """Standard start-of-run setup for every CLI entry point.
+
+    Loads `.env` FIRST, before anything imports huggingface_hub or google-genai,
+    so `HF_TOKEN` is already in os.environ when the Hub client initializes. Doing
+    this later means the token is present but was read too late to be used, and
+    you get anonymous rate limits while holding a valid token.
+    """
+    load_project_env()
+    if quiet_deps:
+        quiet_third_party_logs()
+
+
 def get_api_key(*names: str) -> str | None:
     """First non-empty value among `names`, after loading `.env`."""
     load_project_env()

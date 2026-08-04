@@ -343,6 +343,9 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from config import setup_run
+
+    setup_run()
 
     inputs = args.inp or [Path("data/interim/labeled.jsonl")]
     missing = [p for p in [*inputs, *args.gold_from] if not p.exists()]

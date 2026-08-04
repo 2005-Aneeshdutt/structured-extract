@@ -525,6 +525,11 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # Before load_corpus: HF_TOKEN must be in os.environ prior to the Hub client
+    # initializing, or the download runs anonymously despite a valid token.
+    from config import setup_run
+
+    setup_run()
     random.seed(args.seed)
 
     postings = load_corpus(args.n, seed=args.seed, max_rows=args.max_corpus_rows)

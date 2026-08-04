@@ -407,6 +407,9 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from config import setup_run
+
+    setup_run()
 
     if args.split == "test":
         LOGGER.info("evaluating on the HELD-OUT TEST SPLIT -- results are final, do not tune against them")
