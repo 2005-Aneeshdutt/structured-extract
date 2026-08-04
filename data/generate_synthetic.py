@@ -709,10 +709,16 @@ def main(argv: list[str] | None = None) -> int:
     LOGGER.info("labeling %d postings with teacher=%s n_samples=%d", len(postings), args.teacher, args.n_samples)
 
     cache = ResponseCache(args.cache)
+    # Budget precedence: CLI flag > .env > per-teacher default. The .env layer
+    # exists because the ceiling is a property of YOUR account, not of the
+    # command being run -- setting it once beats remembering a flag on every
+    # invocation of a run that spans days.
+    from config import get_int
+
     default_rpm, default_rpd = DEFAULT_BUDGETS[args.teacher]
     budget = Budget(
-        requests_per_minute=args.requests_per_minute or default_rpm,
-        requests_per_day=args.requests_per_day or default_rpd,
+        requests_per_minute=args.requests_per_minute or get_int("REQUESTS_PER_MINUTE") or default_rpm,
+        requests_per_day=args.requests_per_day or get_int("REQUESTS_PER_DAY") or default_rpd,
     )
     teacher: TeacherFn
     teacher_model = args.teacher_model or {

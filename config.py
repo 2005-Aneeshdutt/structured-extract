@@ -135,6 +135,24 @@ def require_gemini_key() -> str:
     )
 
 
+def get_int(name: str) -> int | None:
+    """Integer setting from env/`.env`, or None if unset or blank.
+
+    Raises on a non-numeric value rather than falling back to the default. A
+    mistyped budget that silently reverts to 1500/day is the same failure mode as
+    a `.env` that is never read: the setting appears to be in effect, the run
+    behaves as though it is not, and nothing says so.
+    """
+    load_project_env()
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer, got {raw!r} (check {ENV_PATH})") from None
+
+
 def require_openrouter_key() -> str:
     """OpenRouter API key, or exit with instructions that name the actual file.
 

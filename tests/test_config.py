@@ -19,7 +19,8 @@ import config
 def _reset_module_state(monkeypatch):
     """load_project_env caches after the first call; reset between tests."""
     monkeypatch.setattr(config, "_loaded", False)
-    for var in ("GOOGLE_API_KEY", "GEMINI_API_KEY", "HF_TOKEN"):
+    for var in ("GOOGLE_API_KEY", "GEMINI_API_KEY", "HF_TOKEN",
+                "OPENROUTER_API_KEY", "REQUESTS_PER_DAY", "REQUESTS_PER_MINUTE"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -54,6 +55,50 @@ class TestLoading:
     def test_falls_back_to_the_first_name_that_has_a_value(self, tmp_path, monkeypatch):
         monkeypatch.setattr(config, "ENV_PATH", _write_env(tmp_path, "GEMINI_API_KEY=legacy\n"))
         assert config.get_api_key("GOOGLE_API_KEY", "GEMINI_API_KEY") == "legacy"
+
+
+class TestIntSettings:
+    """`REQUESTS_PER_DAY`/`REQUESTS_PER_MINUTE` shipped in .env for a while with
+    no reader. These tests exist so the setting stays wired to the budget."""
+
+    def test_reads_an_integer_from_the_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "ENV_PATH", _write_env(tmp_path, "REQUESTS_PER_DAY=8000\n"))
+        assert config.get_int("REQUESTS_PER_DAY") == 8000
+
+    def test_blank_means_use_the_default(self, tmp_path, monkeypatch):
+        """Blank must be None, not 0 -- a 0/day budget silently labels nothing."""
+        monkeypatch.setattr(config, "ENV_PATH", _write_env(tmp_path, "REQUESTS_PER_DAY=\n"))
+        assert config.get_int("REQUESTS_PER_DAY") is None
+
+    def test_unset_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "ENV_PATH", tmp_path / "nonexistent")
+        assert config.get_int("REQUESTS_PER_DAY") is None
+
+    def test_garbage_raises_rather_than_falling_back(self, tmp_path, monkeypatch):
+        """A typo'd budget must not silently revert to the built-in default."""
+        monkeypatch.setattr(config, "ENV_PATH", _write_env(tmp_path, "REQUESTS_PER_DAY=1,500\n"))
+        with pytest.raises(SystemExit, match="must be an integer"):
+            config.get_int("REQUESTS_PER_DAY")
+
+
+class TestOpenRouterKey:
+    def test_reads_the_key(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "ENV_PATH",
+                            _write_env(tmp_path, "OPENROUTER_API_KEY=sk-or-v1-abc\n"))
+        assert config.require_openrouter_key() == "sk-or-v1-abc"
+
+    def test_missing_key_names_the_file_and_the_quota_doc(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "ENV_PATH", _write_env(tmp_path, "OPENROUTER_API_KEY=\n"))
+        with pytest.raises(SystemExit) as exc:
+            config.require_openrouter_key()
+        msg = str(exc.value)
+        assert str(tmp_path / ".env") in msg
+        assert "limits" in msg, "the credit-gated daily cap is the thing users trip on"
+
+    def test_gemini_key_does_not_satisfy_openrouter(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "ENV_PATH", _write_env(tmp_path, "GOOGLE_API_KEY=AIzaReal\n"))
+        with pytest.raises(SystemExit):
+            config.require_openrouter_key()
 
 
 class TestPlaceholderRejection:
