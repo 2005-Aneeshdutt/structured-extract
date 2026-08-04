@@ -608,6 +608,71 @@ def gemini_response_schema() -> dict[str, Any]:
     )
 
 
+def _strict_json_schema(node: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite one Gemini/OpenAPI node as strict JSON Schema (OpenAI dialect).
+
+    Derived from `gemini_response_schema()` rather than written out a second time
+    so the two teachers are provably decoding against the same contract. A
+    hand-maintained copy would drift the first time a field is added, and the
+    failure mode is silent: the OpenRouter teacher would emit labels missing a
+    field that the Gemini teacher always fills, and the difference would surface
+    only as unexplained per-field recall loss in the final table.
+
+    Three concrete dialect differences, each of which is a hard error upstream if
+    left untranslated:
+
+    * `nullable: true` -> `type: ["x", "null"]`. OpenAI-dialect validators do not
+      recognise the OpenAPI `nullable` keyword and will reject a null the model
+      legitimately wants to emit -- and null is the *correct* answer for most of
+      our fields, so this is the difference that matters most.
+    * `additionalProperties: false` is mandatory on every object under
+      `strict: true`; omitting it fails schema validation at request time.
+    * `propertyOrdering` is Gemini-only and is dropped. Field order is therefore
+      not pinned here, which is why `to_target_json` re-serialises in canonical
+      order before anything compares two samples byte-wise.
+    """
+    node_type = node["type"]
+    nullable = bool(node.get("nullable", False))
+    out: dict[str, Any] = {"type": [node_type, "null"] if nullable else node_type}
+
+    if "enum" in node:
+        # `null` goes in the enum list as well as the type union. Per JSON Schema,
+        # `enum` constrains *every* instance including nulls, so a nullable enum
+        # that omits null is unsatisfiable -- the model is told it may return null
+        # and simultaneously that null is not an allowed value. Providers using a
+        # real grammar compiler (xgrammar, outlines) enforce that contradiction.
+        out["enum"] = [*node["enum"], None] if nullable else list(node["enum"])
+
+    if node_type == "object":
+        props = node["properties"]
+        out["properties"] = {k: _strict_json_schema(v) for k, v in props.items()}
+        out["required"] = list(props)  # strict mode: every property must be required
+        out["additionalProperties"] = False
+    elif node_type == "array":
+        out["items"] = _strict_json_schema(node["items"])
+
+    return out
+
+
+def openai_response_schema(name: str = "job_posting") -> dict[str, Any]:
+    """`response_format` payload for OpenAI-compatible APIs (OpenRouter, vLLM...).
+
+    Returns the full `response_format` object, not just the schema, because
+    `strict: true` is not optional for our purposes: without it most providers
+    treat the schema as a *hint* appended to the prompt rather than a decoding
+    constraint, and we are back to JSON-repair heuristics in the data path --
+    exactly what constrained decoding was chosen to eliminate.
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "strict": True,
+            "schema": _strict_json_schema(gemini_response_schema()),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Flatten / access helpers shared by eval and the audit
 # ---------------------------------------------------------------------------

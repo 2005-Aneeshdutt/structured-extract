@@ -319,6 +319,41 @@ the wall clock, but the student would be trained toward one model's conventions
 and graded against another's. That train/test label mismatch is not worth two
 days.
 
+<details>
+<summary><b>Swapping the teacher vendor (OpenRouter)</b></summary>
+
+The labeling protocol is transport-agnostic — voting, grounding and the platform
+audit never touch the vendor — so the teacher is swappable:
+
+```bash
+$EDITOR .env                                   # paste OPENROUTER_API_KEY
+make label-gold TEACHER=openrouter TEACHER_ARGS="--requests-per-day 1000"
+# Windows:  .\run.ps1 label-gold --teacher openrouter --requests-per-day 1000
+```
+
+Two things decide whether this is a good idea for *your* account:
+
+- **Quota is the constraint, not quality.** Google AI Studio gives 1,500
+  req/day free. OpenRouter's free-model allowance is a per-**account** daily cap
+  that is credit-gated and, without purchased credit, an order of magnitude
+  smaller — which turns a 5-day chore into a months-long one. Check
+  [your real limit](https://openrouter.ai/docs/api-reference/limits) and pass it
+  as `--requests-per-day`; the budget stops cleanly at that ceiling instead of
+  collecting a run of 429s. **Gemini remains the default for this reason.**
+- **Constrained decoding must survive the swap.** The request sends
+  `provider.require_parameters=true`, so OpenRouter routes only to providers
+  that actually implement `response_format: json_schema`. Without it the call
+  succeeds against a provider that ignored the schema and the label set silently
+  degrades to free-form JSON. `--no-structured-output` opts out deliberately and
+  logs a warning; expect parse losses.
+
+The OpenAI-strict schema is *translated from* `gemini_response_schema()` rather
+than written twice ([`schema.py`](data/schema.py)), so both teachers provably
+decode against the same contract. The cache key includes the model id, so labels
+from the two transports never collide.
+
+</details>
+
 **2 · Train + quantize** — both on Kaggle. Full copy-paste runbook with timing
 and failure modes: **[`training/KAGGLE.md`](training/KAGGLE.md)**.
 

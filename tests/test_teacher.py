@@ -12,8 +12,15 @@ from __future__ import annotations
 import json
 
 from data.corpus import RawPosting
-from data.generate_synthetic import ResponseCache, label_posting, vote
-from data.schema import JobPosting, Location, Salary, to_target_json
+from data.generate_synthetic import DEFAULT_BUDGETS, ResponseCache, label_posting, vote
+from data.schema import (
+    JobPosting,
+    Location,
+    Salary,
+    gemini_response_schema,
+    openai_response_schema,
+    to_target_json,
+)
 
 SOURCE = ("Acme is hiring a Backend Engineer in Austin, TX. Full-time, senior. "
           "$120,000 per year. Requires 5 years of Python and SQL. Bachelor's degree.")
@@ -64,6 +71,81 @@ class TestSampleIndependence:
         assert len({s for _t, s in seen}) == 3, "each sample needs its own index"
         assert seen[0][0] == 0.0, "sample 0 must be greedy"
         assert all(t == 0.4 for t, _s in seen[1:]), "samples 1..k share the temperature"
+
+
+class TestOpenAISchemaTranslation:
+    """The OpenRouter teacher decodes against a translated copy of the Gemini schema.
+
+    Both teachers must be held to the same contract, so these assert the
+    translation preserves it rather than just that it produces valid-looking JSON
+    Schema. A drift here does not raise -- it produces labels with a quietly
+    different shape.
+    """
+
+    def _schema(self) -> dict:
+        return openai_response_schema()["json_schema"]["schema"]
+
+    def test_strict_mode_is_requested(self):
+        rf = openai_response_schema()
+        assert rf["type"] == "json_schema"
+        assert rf["json_schema"]["strict"] is True, \
+            "without strict, response_format is a hint and JSON is no longer guaranteed"
+
+    def test_same_top_level_fields_as_gemini(self):
+        assert set(self._schema()["properties"]) == set(
+            gemini_response_schema()["properties"]
+        ), "the two teachers must decode against the same field set"
+
+    def test_nullable_becomes_a_type_union(self):
+        """`nullable: true` is an OpenAPI keyword; OpenAI-dialect validators ignore it."""
+        props = self._schema()["properties"]
+        assert props["company_name"]["type"] == ["string", "null"]
+        assert props["years_experience_min"]["type"] == ["integer", "null"]
+        assert props["job_title"]["type"] == "string", "non-nullable must stay scalar"
+
+    def test_no_openapi_keywords_survive(self):
+        """`nullable` and `propertyOrdering` are rejected or ignored downstream."""
+        blob = json.dumps(self._schema())
+        assert "nullable" not in blob
+        assert "propertyOrdering" not in blob
+
+    def test_every_object_is_closed_and_fully_required(self):
+        """strict:true demands additionalProperties:false and all keys required."""
+        def check(node: dict, path: str = "$") -> None:
+            types = node["type"] if isinstance(node["type"], list) else [node["type"]]
+            if "object" in types:
+                assert node["additionalProperties"] is False, f"{path} is open"
+                assert set(node["required"]) == set(node["properties"]), \
+                    f"{path} must require every property"
+                for k, v in node["properties"].items():
+                    check(v, f"{path}.{k}")
+            if "array" in types:
+                check(node["items"], f"{path}[]")
+
+        check(self._schema())
+
+    def test_nullable_enum_admits_null(self):
+        """A nullable enum that omits null from `enum` is unsatisfiable."""
+        emp = self._schema()["properties"]["employment_type"]
+        assert emp["type"] == ["string", "null"]
+        assert None in emp["enum"]
+        assert "full_time" in emp["enum"]
+
+    def test_nested_objects_are_translated_too(self):
+        loc = self._schema()["properties"]["location"]
+        assert loc["additionalProperties"] is False
+        assert loc["properties"]["city"]["type"] == ["string", "null"]
+
+
+class TestBudgetDefaults:
+    def test_every_teacher_choice_has_a_budget(self):
+        """Missing entry = KeyError at runtime, after the corpus load."""
+        assert set(DEFAULT_BUDGETS) == {"gemini", "openrouter", "mock"}
+
+    def test_openrouter_default_is_the_conservative_case(self):
+        """Free-tier cap is credit-gated; overshooting it costs a run of 429s."""
+        _rpm, rpd = DEFAULT_BUDGETS["openrouter"]
+        assert rpd < DEFAULT_BUDGETS["gemini"][1]
 
 
 class TestVoting:

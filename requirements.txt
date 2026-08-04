@@ -19,6 +19,8 @@ ftfy>=6.2               # fixes the mojibake ("Â·", "â€™") that is endemi
 # --- teacher / ceiling model (free tier) ---
 google-genai>=1.0       # NOT google-generativeai (deprecated); new unified SDK
 tenacity>=8.3           # backoff for 429s on the free tier
+requests>=2.32          # OpenRouter teacher. Already a transitive dep of datasets;
+                        # declared explicitly because we import it directly.
 
 # --- local inference for eval ---
 # Upper bounds are not paranoia. An unbounded `transformers>=4.44` resolved to

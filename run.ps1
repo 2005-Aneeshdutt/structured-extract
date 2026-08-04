@@ -90,6 +90,8 @@ switch ($Target) {
   DATA  (needs GOOGLE_API_KEY in .env - run these in order)
     label-gold     PHASE 1: held-out labels, 3-sample self-consistency vote
     label-bulk     PHASE 2: training labels, single pass, skips phase-1 postings
+                   Both accept extra flags, e.g.
+                     .\run.ps1 label-gold --teacher openrouter --requests-per-day 1000
     prepare        Clean, split, format for SFT, export HF + JSONL
 
   EVALUATION  (needs a trained adapter)
@@ -128,20 +130,23 @@ switch ($Target) {
     }
 
     # -- Phase 1. Run FIRST: phase 2 excludes these postings by id. ------------
+    # Extra arguments are appended after the defaults, and argparse honours the
+    # LAST occurrence of an option, so anything here can be overridden ad hoc:
+    #     .\run.ps1 label-gold --teacher openrouter --requests-per-day 1000
     "label-gold" {
-        Invoke-Step "PHASE 1 - held-out labels (3-sample vote)" @(
+        Invoke-Step "PHASE 1 - held-out labels (3-sample vote)" (@(
             "-m", "data.generate_synthetic", "--n", "1250", "--teacher", "gemini",
             "--n-samples", "3", "--out", "data/interim/labeled_gold.jsonl",
-            "--audit-out", "results/label_audit.md")
+            "--audit-out", "results/label_audit.md") + $Rest)
         Write-Host "`nPhase 1 chunk done. Re-run this same command tomorrow to continue." -ForegroundColor Green
     }
 
     "label-bulk" {
-        Invoke-Step "PHASE 2 - training labels (single pass)" @(
+        Invoke-Step "PHASE 2 - training labels (single pass)" (@(
             "-m", "data.generate_synthetic", "--n", "5250", "--teacher", "gemini",
             "--n-samples", "1", "--exclude-from", "data/interim/labeled_gold.jsonl",
             "--out", "data/interim/labeled.jsonl",
-            "--audit-out", "results/label_audit_bulk.md")
+            "--audit-out", "results/label_audit_bulk.md") + $Rest)
         Write-Host "`nPhase 2 chunk done. Re-run this same command tomorrow to continue." -ForegroundColor Green
     }
 

@@ -135,6 +135,36 @@ def require_gemini_key() -> str:
     )
 
 
+def require_openrouter_key() -> str:
+    """OpenRouter API key, or exit with instructions that name the actual file.
+
+    Kept separate from `require_gemini_key` rather than parameterised because the
+    remediation text differs in the part that actually helps: OpenRouter's free
+    tier is credit-gated (see the note about 50/day vs 1000/day), and a user
+    hitting this error needs to know that before they plan a labeling schedule
+    around it.
+    """
+    key = get_api_key("OPENROUTER_API_KEY")
+    if key:
+        return key
+    have_env = ENV_PATH.exists()
+    raise SystemExit(
+        "No OpenRouter API key found.\n\n"
+        + (
+            f"  {ENV_PATH} exists but OPENROUTER_API_KEY is empty or still a placeholder.\n"
+            "  Open it and paste your key after 'OPENROUTER_API_KEY='.\n"
+            if have_env
+            else f"  Create {ENV_PATH}:\n"
+                 "      cp project.env.example .env\n"
+                 "  then paste your key after 'OPENROUTER_API_KEY='.\n"
+        )
+        + "\n  Key: https://openrouter.ai/settings/keys  (starts with 'sk-or-v1-')\n"
+        "\n  Check YOUR daily limit before planning a run -- OpenRouter caps free\n"
+        "  models per account, not per model, and the cap depends on lifetime\n"
+        "  credit purchased: https://openrouter.ai/docs/api-reference/limits\n"
+    )
+
+
 def get_hf_token() -> str | None:
     """HF token for pushing models/datasets. Optional -- reads are anonymous."""
     return get_api_key("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN")

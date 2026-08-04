@@ -68,6 +68,7 @@ from data.schema import (
     canonicalize_terms,
     flatten,
     gemini_response_schema,
+    openai_response_schema,
     parse_prediction,
     to_target_json,
     ungrounded_fields,
@@ -76,6 +77,26 @@ from data.schema import (
 LOGGER = logging.getLogger("teacher")
 
 DEFAULT_MODEL = "gemini-2.0-flash"
+
+#: Default OpenRouter slug. Deliberately the same underlying model family as the
+#: Gemini path: if you label part of the corpus through one transport and part
+#: through the other, matching the model keeps the label distribution comparable.
+#: Switching model families mid-corpus does not -- it puts a systematic
+#: annotator difference between the training slice and the held-out slice, which
+#: is indistinguishable from the student underfitting.
+DEFAULT_OPENROUTER_MODEL = "google/gemini-2.0-flash-exp:free"
+
+#: (requests_per_minute, requests_per_day) per teacher, used when the CLI flags
+#: are left unset. These are *starting points*, not guarantees -- free-tier
+#: quotas change and OpenRouter's daily cap depends on lifetime credit purchased
+#: on the account. The OpenRouter numbers are the conservative (no-credit) case
+#: on purpose: overshooting the real cap costs a run of 429s, undershooting only
+#: costs one extra day.
+DEFAULT_BUDGETS: dict[str, tuple[int, int]] = {
+    "gemini": (15, 1500),
+    "openrouter": (20, 50),
+    "mock": (10_000, 10_000_000),
+}
 
 
 # ===========================================================================
@@ -239,6 +260,122 @@ class GeminiTeacher:
                 ),
             )
             return resp.text or ""
+
+        out = _call()
+        if self.cache:
+            self.cache.put(ck, out)
+        return out
+
+
+class OpenRouterTeacher:
+    """Same protocol as GeminiTeacher, against any OpenAI-compatible model.
+
+    Why this exists: it decouples the labeling protocol from one vendor's free
+    tier. The self-consistency vote, the grounding filter and the platform audit
+    are all teacher-agnostic; only the transport was Google-specific. With this
+    class the teacher becomes a swappable component, which is also the honest
+    answer to "what if Gemini's free tier changes?" -- rerun with a different
+    `--teacher-model` and the cache, budget and audit all still apply.
+
+    Two things to know before choosing this over Gemini for a bulk run:
+
+    * **Quota, not quality, is the deciding factor.** Google AI Studio gives
+      1500 requests/day for free. OpenRouter's free-model allowance is a
+      per-account daily cap that is substantially smaller unless credit has been
+      purchased. Check yours at https://openrouter.ai/docs/api-reference/limits
+      and pass the real number as --requests-per-day; the Budget class will stop
+      cleanly at that ceiling instead of collecting a run of 429s.
+    * **Structured output is provider-dependent.** Not every backend behind a
+      given model slug implements `response_format: json_schema`. We send
+      `provider.require_parameters=true` so OpenRouter routes *only* to providers
+      that honour it -- without that flag the request silently succeeds against a
+      provider that ignored the schema, and the label set quietly degrades to
+      whatever free-form JSON the model felt like emitting.
+    """
+
+    URL = "https://openrouter.ai/api/v1/chat/completions"
+
+    def __init__(
+        self,
+        model: str = DEFAULT_OPENROUTER_MODEL,
+        cache: ResponseCache | None = None,
+        budget: Budget | None = None,
+        api_key: str | None = None,
+        structured: bool = True,
+    ) -> None:
+        import requests  # local import, mirroring GeminiTeacher's lazy SDK import
+
+        from config import require_openrouter_key
+
+        self._requests = requests
+        self.model = model
+        self.cache = cache
+        self.budget = budget or Budget(requests_per_minute=20, requests_per_day=50)
+        self.structured = structured
+        self._session = requests.Session()
+        self._session.headers.update({
+            "Authorization": f"Bearer {api_key or require_openrouter_key()}",
+            "Content-Type": "application/json",
+            # OpenRouter attributes traffic by these; harmless but conventional.
+            "HTTP-Referer": "https://github.com/2005-Aneeshdutt/structured-extract",
+            "X-Title": "structured-extract",
+        })
+        self._response_format = openai_response_schema() if structured else None
+        if not structured:
+            LOGGER.warning(
+                "structured output DISABLED -- teacher JSON is no longer valid by "
+                "construction and malformed replies will be dropped as parse failures"
+            )
+
+    def _payload(self, prompt: str, temperature: float) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": 1024,
+        }
+        if self._response_format is not None:
+            body["response_format"] = self._response_format
+            # Refuse a provider that would ignore response_format rather than
+            # accept labels generated without the constraint. See class docstring.
+            body["provider"] = {"require_parameters": True}
+        return body
+
+    def __call__(self, posting_text: str, temperature: float = 0.0, sample_idx: int = 0) -> str:
+        from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+        prompt = build_user_prompt(posting_text)
+        ck = ResponseCache.key(self.model, temperature, prompt, sample_idx)
+        if self.cache and (hit := self.cache.get(ck)) is not None:
+            return hit
+
+        @retry(
+            retry=retry_if_exception_type(Exception),
+            wait=wait_exponential(multiplier=2, min=2, max=60),
+            stop=stop_after_attempt(5),
+            reraise=True,
+        )
+        def _call() -> str:
+            self.budget.take()
+            resp = self._session.post(
+                self.URL, json=self._payload(prompt, temperature), timeout=120
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"openrouter HTTP {resp.status_code}: {resp.text[:400]}")
+            data = resp.json()
+            # OpenRouter reports upstream provider failures inside a 200 body.
+            # Treating that as success would write the error object into the cache
+            # as if it were a label, and it would only surface later as an
+            # unparseable record with no trace of what went wrong.
+            if "error" in data:
+                raise RuntimeError(f"openrouter error: {json.dumps(data['error'])[:400]}")
+            try:
+                return data["choices"][0]["message"]["content"] or ""
+            except (KeyError, IndexError) as exc:
+                raise RuntimeError(f"unexpected response shape: {json.dumps(data)[:400]}") from exc
 
         out = _call()
         if self.cache:
@@ -531,19 +668,34 @@ def main(argv: list[str] | None = None) -> int:
                     help="cap rows scanned from the source dataset (smoke tests / CI only)")
     ap.add_argument("--out", type=Path, default=Path("data/interim/labeled.jsonl"))
     ap.add_argument("--cache", type=Path, default=Path("data/interim/teacher_cache.jsonl"))
-    ap.add_argument("--teacher", choices=["gemini", "mock"], default="gemini")
-    ap.add_argument("--teacher-model", default=DEFAULT_MODEL)
+    ap.add_argument("--teacher", choices=["gemini", "openrouter", "mock"], default="gemini")
+    ap.add_argument("--teacher-model", default=None,
+                    help="model id; defaults to the right one for --teacher")
+    ap.add_argument("--no-structured-output", action="store_true",
+                    help="openrouter only: drop the json_schema constraint. Widens model "
+                         "choice at the cost of guaranteed-valid JSON -- expect parse losses")
     ap.add_argument("--n-samples", type=int, default=1,
                     help="teacher samples per posting; use 3 for the val/test slice (self-consistency)")
     ap.add_argument("--temperature", type=float, default=0.4,
                     help="temperature for samples 2..k; sample 1 is always greedy")
-    ap.add_argument("--requests-per-day", type=int, default=1500)
-    ap.add_argument("--requests-per-minute", type=int, default=15)
+    # Default None, not a number: the right ceiling depends on --teacher, and a
+    # hardcoded 1500 silently invites 1450 failed requests against a 50/day cap.
+    ap.add_argument("--requests-per-day", type=int, default=None,
+                    help="daily ceiling; defaults per --teacher. Set to YOUR real quota")
+    ap.add_argument("--requests-per-minute", type=int, default=None,
+                    help="per-minute ceiling; defaults per --teacher")
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--exclude-from", type=Path, action="append", default=[],
                     help="skip posting_ids already labeled in this file; repeatable")
     ap.add_argument("--audit-out", type=Path, default=Path("results/label_audit.md"))
     args = ap.parse_args(argv)
+
+    # Validate arguments BEFORE the corpus load. A flag that silently does
+    # nothing is how a run ends up believing it tested the unconstrained path
+    # when it did not -- and rejecting it down at teacher construction would
+    # charge the user a multi-minute dataset fetch to learn about a typo.
+    if args.no_structured_output and args.teacher != "openrouter":
+        ap.error("--no-structured-output applies only to --teacher openrouter")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # Before load_corpus: HF_TOKEN must be in os.environ prior to the Hub client
@@ -557,15 +709,32 @@ def main(argv: list[str] | None = None) -> int:
     LOGGER.info("labeling %d postings with teacher=%s n_samples=%d", len(postings), args.teacher, args.n_samples)
 
     cache = ResponseCache(args.cache)
+    default_rpm, default_rpd = DEFAULT_BUDGETS[args.teacher]
+    budget = Budget(
+        requests_per_minute=args.requests_per_minute or default_rpm,
+        requests_per_day=args.requests_per_day or default_rpd,
+    )
     teacher: TeacherFn
+    teacher_model = args.teacher_model or {
+        "gemini": DEFAULT_MODEL,
+        "openrouter": DEFAULT_OPENROUTER_MODEL,
+        "mock": "mock",
+    }[args.teacher]
+    LOGGER.info(
+        "teacher=%s model=%s budget=%d/min %d/day",
+        args.teacher, teacher_model, budget.requests_per_minute, budget.requests_per_day,
+    )
     if args.teacher == "mock":
         teacher = mock_teacher
-    else:
-        teacher = GeminiTeacher(
-            model=args.teacher_model,
+    elif args.teacher == "openrouter":
+        teacher = OpenRouterTeacher(
+            model=teacher_model,
             cache=cache,
-            budget=Budget(requests_per_minute=args.requests_per_minute, requests_per_day=args.requests_per_day),
+            budget=budget,
+            structured=not args.no_structured_output,
         )
+    else:
+        teacher = GeminiTeacher(model=teacher_model, cache=cache, budget=budget)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     # Resume support: skip postings already written on a previous (quota-limited)
@@ -628,7 +797,7 @@ def main(argv: list[str] | None = None) -> int:
         lines = [
             "# Teacher label audit vs. platform metadata",
             "",
-            f"Teacher: `{args.teacher_model if args.teacher == 'gemini' else 'mock'}`  |  "
+            f"Teacher: `{teacher_model}` via `{args.teacher}`  |  "
             f"labeled examples audited: {len(ok_records)}",
             "",
             "Agreement between teacher labels and LinkedIn's own structured form fields "
