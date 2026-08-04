@@ -201,6 +201,53 @@ class TestGrounding:
                        required_skills=["python"])
         assert ungrounded_fields(obj, self.SOURCE) == []
 
+    def test_region_is_canonicalized_on_construction(self):
+        """Measured: 31.6% of gold labels wrote 'Texas', 68.4% wrote 'TX'.
+
+        That split lived in the TRAINING TARGETS, so the student would learn to
+        pick arbitrarily and then be marked wrong for picking the convention the
+        gold label happened not to use. The validator runs on every JobPosting
+        the codebase builds -- labels and predictions alike -- so normalizing
+        cannot advantage one side of the comparison.
+        """
+        assert Location(region="Texas").region == "TX"
+        assert Location(region="  texas ").region == "TX"
+        assert Location(region="tx").region == "TX"
+        assert Location(region="TX").region == "TX"
+        assert Location(region="District of Columbia").region == "DC"
+
+    def test_non_us_regions_pass_through(self):
+        assert Location(region="Ontario").region == "Ontario"
+        assert Location(region="Bavaria").region == "Bavaria"
+
+    def test_blank_region_becomes_null(self):
+        assert Location(region="   ").region is None
+        assert Location(region=None).region is None
+
+    def test_canonicalization_reaches_nested_parse(self):
+        """It must apply through parse_prediction, not just direct construction."""
+        obj, err = parse_prediction('{"job_title":"Eng","location":{"region":"California"}}')
+        assert err is None and obj is not None
+        assert obj.location.region == "CA"
+
+    def test_canonicalized_region_is_grounded_by_either_spelling(self):
+        """Canonicalization rewrites the value; grounding must not then punish it.
+
+        "Texas" is normalized to "TX" on construction, so a literal substring
+        check against a posting that only ever writes "Texas" would report a
+        perfectly correct extraction as a hallucination. Cost of getting this
+        wrong, measured: 20 extra rejected gold labels.
+        """
+        obj = _minimal(location=Location(region="Texas"))
+        assert obj.location.region == "TX"
+        assert "location.region" not in ungrounded_fields(obj, "Role based in Texas, hybrid.")
+        assert "location.region" not in ungrounded_fields(obj, "Role based in Austin, TX.")
+
+    def test_wrong_region_is_still_flagged(self):
+        """The relaxation must not make the check toothless."""
+        obj = _minimal(location=Location(region="California"))
+        assert "location.region" in ungrounded_fields(obj, "Role based in Austin, TX.")
+
     def test_invented_company_is_flagged(self):
         assert "company_name" in ungrounded_fields(_minimal(company_name="Globex"), self.SOURCE)
 

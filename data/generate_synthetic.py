@@ -57,6 +57,7 @@ from data.corpus import RawPosting, load_corpus
 from data.schema import (
     PLATFORM_AUDITABLE_FIELDS,
     SYSTEM_PROMPT,
+    US_STATE_NAMES,
     EducationLevel,
     EmploymentType,
     JobPosting,
@@ -65,6 +66,7 @@ from data.schema import (
     Salary,
     SeniorityLevel,
     build_user_prompt,
+    canonicalize_region,
     canonicalize_terms,
     flatten,
     gemini_response_schema,
@@ -651,11 +653,20 @@ def audit_against_platform(records: list[dict[str, Any]]) -> dict[str, dict[str,
             a, b = t.lower(), str(plat["title"]).lower()
             bump("job_title", a in b or b in a or len(set(a.split()) & set(b.split())) >= 2)
 
-        loc = str(plat.get("location") or "")
+        # LinkedIn stores location as ONE combined string, in whichever form the
+        # employer typed: "Dallas, TX", "Austin, Texas Metropolitan Area",
+        # "Greater Sacramento". Our schema splits city and region, so a plain
+        # substring test compares "TX" against the whole thing and marks
+        # exactly-correct answers wrong. Measured cost of not normalizing:
+        # location.region audited at 59.6% when the true figure is ~84%, and the
+        # gap was entirely spelling. Accept either spelling on either side.
+        loc = str(plat.get("location") or "").lower()
         if (c := flat.get("location.city")) and loc:
-            bump("location.city", c.lower() in loc.lower())
+            bump("location.city", c.lower() in loc)
         if (r := flat.get("location.region")) and loc:
-            bump("location.region", r.lower() in loc.lower())
+            code = canonicalize_region(r)
+            forms = {r.lower(), (code or "").lower(), US_STATE_NAMES.get(code or "", "")}
+            bump("location.region", any(f and f in loc for f in forms))
 
         if (et := flat.get("employment_type")) and plat.get("formatted_work_type"):
             bump("employment_type", _WORKTYPE_MAP.get(str(plat["formatted_work_type"]).lower()) == et)

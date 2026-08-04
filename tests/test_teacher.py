@@ -64,6 +64,35 @@ class TestCacheKey:
         assert ResponseCache.key("m", 0.0, "p", 1) != base
 
 
+class TestPromptStability:
+    """SCHEMA_CARD is hashed into the teacher cache key via build_user_prompt.
+
+    Changing it mid-corpus is expensive and quiet: every cached response misses
+    (measured: 3,000 gold responses, ~$0.77 of re-labeling), and if only part of
+    the corpus is relabeled, train and test end up annotated under two different
+    prompts -- the prompt drift schema.py's docstring exists to prevent.
+
+    This pins the hash. If you intentionally change the prompt, update the
+    expected value AND re-label the whole corpus, not just the part you noticed.
+    """
+
+    EXPECTED_SHA1 = "efd2d10956f11a9fe389a9937201b73e3788ae63"
+
+    def test_prompt_template_hash_is_pinned(self):
+        import hashlib
+
+        from data.schema import SYSTEM_PROMPT, build_user_prompt
+
+        digest = hashlib.sha1(
+            (SYSTEM_PROMPT + build_user_prompt("PROBE")).encode()
+        ).hexdigest()
+        assert digest == self.EXPECTED_SHA1, (
+            "the prompt changed -- every teacher cache entry is now a miss.\n"
+            "If deliberate: update EXPECTED_SHA1 and re-label the FULL corpus,\n"
+            "because a partial relabel splits train/test across two prompts."
+        )
+
+
 class TestSampleIndependence:
     def test_three_samples_produce_three_distinct_calls(self):
         """A counting teacher proves each sample reaches the model separately."""

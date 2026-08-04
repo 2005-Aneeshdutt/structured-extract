@@ -85,6 +85,76 @@ class PayPeriod(str, Enum):
 # ---------------------------------------------------------------------------
 
 
+#: US state / territory name -> USPS code. Exists because the corpus is
+#: US-dominated and the teacher used both conventions interchangeably: measured
+#: over 297 gold labels carrying a region, 31.6% wrote "Texas" and 68.4% wrote
+#: "TX". That is not a cosmetic split. It is inconsistency *in the training
+#: targets*, so the student learns to pick arbitrarily, and then the evaluator
+#: marks it wrong whenever it picks the convention the gold label did not use --
+#: a self-inflicted accuracy loss on a tier-2 field.
+#:
+#: The original field description ("full name or code as written") is what
+#: invited it, so the description now pins the convention and this map enforces
+#: it. Non-US regions pass through untouched.
+#:
+#: Enforced by a VALIDATOR rather than by an instruction in SCHEMA_CARD, and
+#: that is deliberate on two counts. A validator is deterministic where a prompt
+#: instruction is merely a request, and it applies identically to labels and to
+#: predictions, so normalizing cannot advantage one side of the comparison.
+#: SCHEMA_CARD is also load-bearing in a way that is easy to miss: it is part of
+#: `build_user_prompt`, which is hashed into the teacher cache key AND is the
+#: prompt used at train and eval time. Editing it invalidates every cached
+#: response (measured: 3,000 gold responses, ~$0.77 of re-labeling) and, worse,
+#: silently splits the corpus across two prompts if half of it is already
+#: labeled -- the exact drift this module's docstring opens by warning about.
+US_STATE_CODES: Final[dict[str, str]] = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+    "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC",
+    "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+    "district of columbia": "DC", "washington dc": "DC", "washington d.c.": "DC",
+    "puerto rico": "PR",
+}
+
+#: Reverse lookup, for comparing our canonical code against a source string that
+#: spelled the state out (LinkedIn writes both "Austin, TX" and "Austin, Texas
+#: Metropolitan Area"). Built from the forward map so the two cannot drift.
+US_STATE_NAMES: Final[dict[str, str]] = {v: k for k, v in US_STATE_CODES.items()}
+
+
+def canonicalize_region(value: str | None) -> str | None:
+    """Normalize a US state to its USPS code; pass anything else through.
+
+    Applied as a pydantic validator, so it runs on EVERY JobPosting the codebase
+    constructs -- teacher labels, training targets, and student predictions at
+    eval time alike. That uniformity is the point: normalizing only the labels
+    would penalize a model whose output was right but spelled differently.
+    """
+    if value is None:
+        return None
+    cleaned = " ".join(value.strip().split())
+    if not cleaned:
+        return None
+    code = US_STATE_CODES.get(cleaned.lower())
+    if code:
+        return code
+    # Already a bare 2-letter code for a real state ("tx" -> "TX"). Guarded by
+    # the membership test so a genuine 2-letter non-US region is left alone.
+    if len(cleaned) == 2 and cleaned.upper() in US_STATE_NAMES:
+        return cleaned.upper()
+    return cleaned
+
+
 class Location(BaseModel):
     """Nested object #1. Deliberately includes an enum sub-field.
 
@@ -97,12 +167,19 @@ class Location(BaseModel):
 
     city: str | None = Field(None, description="City name only, e.g. 'Austin'. Null if not stated.")
     region: str | None = Field(
-        None, description="State / province / region, full name or code as written, e.g. 'TX'."
+        None,
+        description="State / province / region. US states as the 2-letter code, e.g. 'TX'.",
     )
+
     country: str | None = Field(None, description="ISO 3166 English country name, e.g. 'United States'.")
     remote_policy: RemotePolicy | None = Field(
         None, description="onsite | hybrid | remote. Null if the posting never says."
     )
+
+    @field_validator("region")
+    @classmethod
+    def _canonical_region(cls, v: str | None) -> str | None:
+        return canonicalize_region(v)
 
 
 class Salary(BaseModel):
@@ -722,7 +799,21 @@ def ungrounded_fields(obj: JobPosting, source: str) -> list[str]:
         # Deliberately substring, not fuzzy: a similarity threshold here would be
         # an unfalsifiable knob that could be tuned until the hallucination number
         # looked good.
-        if isinstance(val, str) and val.strip() and val.lower() not in low:
+        if not (isinstance(val, str) and val.strip()):
+            continue
+        # location.region is the one field we deliberately REWRITE before this
+        # check runs (canonicalize_region maps "Texas" -> "TX"), so a literal
+        # substring test asks the source to contain a string the extractor was
+        # instructed to replace. A posting that says "Texas" and never "TX"
+        # would score as a hallucination for an extraction that is exactly
+        # right. Accept either surface form as evidence -- the canonical value
+        # and the spelled-out name are the same claim about the world.
+        forms = {val.lower()}
+        if fname == "location.region":
+            spelled = US_STATE_NAMES.get(val.upper())
+            if spelled:
+                forms.add(spelled)
+        if not any(f in low for f in forms):
             bad.append(fname)
 
     for fname in ("salary.min_amount", "salary.max_amount"):
