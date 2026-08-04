@@ -304,12 +304,50 @@ class GeminiTeacher:
                     max_output_tokens=1024,
                 ),
             )
-            return resp.text or ""
+            text = resp.text or ""
+            # Same contract as the OpenRouter path: a truncated 200 must never
+            # reach the cache, or a transient fault becomes permanent.
+            _reject_if_unusable(text, structured=True)
+            return text
 
         out = _call()
         if self.cache:
             self.cache.put(ck, out)
         return out
+
+
+def _reject_if_unusable(content: str, *, structured: bool, finish: str | None = None) -> None:
+    """Raise if a 200 response is not actually a usable label. Caller retries.
+
+    Why this is not the caller's problem to notice later
+    ----------------------------------------------------
+    A provider under strain returns HTTP 200 with a completion that simply stops
+    mid-token: `'{\\n  "job_'` is a real 9-character response from this corpus.
+    Without this check the pipeline treats that as a successful call and writes
+    it to the response cache, which makes a TRANSIENT provider fault PERMANENT --
+    every later rerun serves the truncated string from disk, and no amount of
+    re-running recovers the label. Measured cost of learning this the slow way:
+    767 of 6,024 cached responses (12.7%) were truncated, and phase 2's yield
+    fell from ~88% to 67%.
+
+    Raising inside the retry wrapper instead is what a truncated stream deserves:
+    it is exactly the transient failure `tenacity` exists to paper over. Only
+    responses that survive `parse_prediction` reach the cache.
+
+    Skipped when `structured` is False, because there the caller has explicitly
+    accepted parse failures as normal and retrying five times would just burn
+    quota on a model that was never going to comply.
+    """
+    if not structured:
+        return
+    if finish and finish not in ("stop", "STOP", None):
+        # length/content_filter/error - not a complete answer, do not cache it.
+        raise RuntimeError(f"incomplete completion (finish_reason={finish!r})")
+    obj, reason = parse_prediction(content)
+    if obj is None:
+        raise RuntimeError(
+            f"unusable completion ({reason}), {len(content)} chars: {content[:120]!r}"
+        )
 
 
 class OpenRouterTeacher:
@@ -405,8 +443,12 @@ class OpenRouterTeacher:
         )
         def _call() -> str:
             self.budget.take()
+            # (connect, read) rather than one number. The read timeout is what
+            # bounds a provider that accepts the connection and then trickles or
+            # stalls; a single scalar leaves the connect phase sharing the same
+            # generous budget. A stalled call here sat idle for four hours.
             resp = self._session.post(
-                self.URL, json=self._payload(prompt, temperature), timeout=120
+                self.URL, json=self._payload(prompt, temperature), timeout=(10, 90)
             )
             if resp.status_code != 200:
                 raise RuntimeError(f"openrouter HTTP {resp.status_code}: {resp.text[:400]}")
@@ -418,9 +460,12 @@ class OpenRouterTeacher:
             if "error" in data:
                 raise RuntimeError(f"openrouter error: {json.dumps(data['error'])[:400]}")
             try:
-                return data["choices"][0]["message"]["content"] or ""
+                content = data["choices"][0]["message"]["content"] or ""
             except (KeyError, IndexError) as exc:
                 raise RuntimeError(f"unexpected response shape: {json.dumps(data)[:400]}") from exc
+            _reject_if_unusable(content, structured=self.structured,
+                                finish=data["choices"][0].get("finish_reason"))
+            return content
 
         out = _call()
         if self.cache:
