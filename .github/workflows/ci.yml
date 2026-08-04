@@ -52,14 +52,16 @@ jobs:
         env:
           HF_HUB_DISABLE_PROGRESS_BARS: "1"
         run: |
+          # 250, not 120: prepare_dataset refuses to build splits with fewer than
+          # 100 training examples left after test+val.
           python -m data.generate_synthetic \
-            --n 120 --max-corpus-rows 3000 --teacher mock \
+            --n 250 --max-corpus-rows 4000 --teacher mock \
             --out /tmp/labeled.jsonl --cache /tmp/cache.jsonl \
             --audit-out /tmp/label_audit.md
           python -m data.prepare_dataset \
             --in /tmp/labeled.jsonl --out /tmp/processed \
             --stats-out /tmp/dataset_stats.md \
-            --test-size 20 --val-size 20
+            --test-size 25 --val-size 25
           test -s /tmp/processed/train.jsonl
           test -s /tmp/processed/test_ids.txt
           test -s /tmp/processed/fewshot_exemplars.json

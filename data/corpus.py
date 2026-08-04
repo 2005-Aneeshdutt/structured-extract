@@ -26,11 +26,13 @@ against independent ground truth on 10 of our 18 scored leaf fields. See
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import random
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import ftfy
@@ -302,6 +304,19 @@ def _to_posting(row: dict[str, Any]) -> RawPosting | None:
     )
 
 
+def _cache_key(n_target: int, seed: int, dataset_id: str, dedup_threshold: float,
+               stratum_targets: dict[str, float], max_rows: int | None) -> str:
+    payload = json.dumps(
+        {"n": n_target, "seed": seed, "ds": dataset_id, "thr": dedup_threshold,
+         "strata": sorted(stratum_targets.items()), "max_rows": max_rows,
+         # Bump when cleaning/stratification logic changes, so a stale cache
+         # cannot silently outlive the code that produced it.
+         "logic_version": 2},
+        sort_keys=True,
+    )
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
 def load_corpus(
     n_target: int,
     *,
@@ -310,14 +325,38 @@ def load_corpus(
     dedup_threshold: float = 0.75,
     stratum_targets: dict[str, float] | None = None,
     max_rows: int | None = None,
+    cache_dir: Path | None = Path("data/interim"),
 ) -> list[RawPosting]:
     """Load, clean, dedupe and stratify down to `n_target` postings.
 
     Pipeline order is load -> clean -> filter -> DEDUPE -> stratify -> sample.
     Deduplication happens before stratified sampling so that duplicate-heavy
     strata (large employers post salary bands most consistently) cannot dominate.
+
+    Results are cached to disk. That is not a micro-optimization: cleaning and
+    MinHash-deduplicating 33k postings takes ~20 minutes, and the labeling run it
+    feeds is metered at 1,500 API calls/day, so it is *designed* to be re-run
+    daily for about a week. Without a cache that is ~2 hours of recomputing a
+    deterministic result. The cache key covers every argument plus a logic
+    version, so changing any of them produces a different file rather than a
+    silently stale one.
     """
     from datasets import load_dataset  # local import keeps schema.py-only users light
+
+    targets = stratum_targets or STRATUM_TARGETS
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        key = _cache_key(n_target, seed, dataset_id, dedup_threshold, targets, max_rows)
+        cache_path = Path(cache_dir) / f"corpus_{n_target}_{key}.jsonl"
+        if cache_path.exists():
+            postings = []
+            with cache_path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip():
+                        rec = json.loads(line)
+                        postings.append(RawPosting(rec["posting_id"], rec["text"], rec["platform"]))
+            LOGGER.info("corpus cache hit: %d postings from %s", len(postings), cache_path)
+            return postings
 
     LOGGER.info("loading %s ...", dataset_id)
     ds = load_dataset(dataset_id, split="train")
@@ -340,7 +379,6 @@ def load_corpus(
     rng.shuffle(postings)  # shuffle BEFORE dedup so LSH keeps a random representative
     postings = deduplicate(postings, threshold=dedup_threshold)
 
-    targets = stratum_targets or STRATUM_TARGETS
     buckets: dict[str, list[RawPosting]] = {k: [] for k in targets}
     for p in postings:
         buckets.setdefault(stratum_of(p), []).append(p)
@@ -361,12 +399,27 @@ def load_corpus(
         selected.extend(leftovers[: n_target - len(selected)])
 
     rng.shuffle(selected)
+    selected = selected[:n_target]
     LOGGER.info(
         "corpus ready: %d postings | strata=%s",
         len(selected),
         {k: sum(1 for p in selected if stratum_of(p) == k) for k in targets},
     )
-    return selected[:n_target]
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for p in selected:
+                fh.write(json.dumps(
+                    {"posting_id": p.posting_id, "text": p.text, "platform": p.platform},
+                    ensure_ascii=False) + "\n")
+        # Atomic replace: a Ctrl-C mid-write must not leave a truncated cache
+        # that later loads as a silently smaller corpus.
+        tmp.replace(cache_path)
+        LOGGER.info("cached corpus -> %s (delete to force a rebuild)", cache_path)
+
+    return selected
 
 
 def describe_lengths(postings: Iterable[RawPosting]) -> dict[str, float]:

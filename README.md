@@ -271,9 +271,24 @@ pip install -r requirements.txt
 # torch: install the CUDA build for your driver FIRST, e.g.
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 
-make test          # 44 unit tests, no GPU or network needed
-make smoke         # full data pipeline on 120 postings with a mock teacher, no API key
+make test          # unit tests, no GPU or network needed
+make smoke         # full data pipeline on 250 postings with a mock teacher, no API key
 ```
+
+**On Windows**, `make` is not installed. Use the bundled runner instead — same
+target names throughout this README:
+
+```powershell
+.\run.ps1 help
+.\run.ps1 test
+.\run.ps1 smoke
+```
+
+The corpus is cached after the first build (`data/interim/corpus_*.jsonl`).
+Cleaning and MinHash-deduplicating 33k postings takes ~20 minutes, and the
+labeling run it feeds is metered at 1,500 calls/day — so it is *designed* to be
+re-run daily for about a week. Without the cache that is two hours of recomputing
+a deterministic result. Delete the file to force a rebuild.
 
 **1 · Data** — two phases, in order, one teacher throughout. Free Gemini tier:
 ~7,750 calls at 1,500/day ≈ **5 days of wall clock**. Both phases are cached and

@@ -22,12 +22,15 @@ lint:  ## ruff
 test:  ## Unit tests
 	pytest tests/ -q
 
-smoke:  ## End-to-end data pipeline on 120 postings with the mock teacher (no API key)
-	$(PY) -m data.generate_synthetic --n 120 --max-corpus-rows 3000 --teacher mock \
+# 250 postings, not 120: prepare_dataset refuses to build splits with fewer than
+# 100 training examples left after test+val, and a smoke test that trips that
+# guard tests nothing.
+smoke:  ## End-to-end data pipeline on 250 postings with the mock teacher (no API key)
+	$(PY) -m data.generate_synthetic --n 250 --max-corpus-rows 4000 --teacher mock \
 		--out data/interim/smoke_labeled.jsonl --cache data/interim/smoke_cache.jsonl
 	$(PY) -m data.prepare_dataset --in data/interim/smoke_labeled.jsonl \
 		--out data/processed_smoke --stats-out results/dataset_stats_smoke.md \
-		--test-size 20 --val-size 20
+		--test-size 25 --val-size 25
 
 # ---------------------------------------------------------------------------
 # 1. Data — the long pole. TWO PHASES, in this order, one teacher throughout.
