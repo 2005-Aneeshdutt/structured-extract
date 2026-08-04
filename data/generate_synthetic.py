@@ -43,7 +43,6 @@ import contextlib
 import hashlib
 import json
 import logging
-import os
 import random
 import re
 import sys
@@ -184,12 +183,9 @@ class GeminiTeacher:
     ) -> None:
         from google import genai  # local import so --teacher mock needs no SDK
 
-        key = api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        if not key:
-            raise SystemExit(
-                "Set GOOGLE_API_KEY (free key: https://aistudio.google.com/apikey), "
-                "or pass --teacher mock to smoke-test the pipeline offline."
-            )
+        from config import require_gemini_key
+
+        key = api_key or require_gemini_key()
         self.client = genai.Client(api_key=key)
         self.model = model
         self.cache = cache

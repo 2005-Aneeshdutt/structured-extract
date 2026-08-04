@@ -35,7 +35,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 import time
 from dataclasses import asdict
@@ -217,10 +216,9 @@ class GeminiBackend:
     def __init__(self, model: str = "gemini-2.0-flash", constrained: bool = True) -> None:
         from google import genai
 
-        key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        if not key:
-            raise SystemExit("GOOGLE_API_KEY not set")
-        self.client = genai.Client(api_key=key)
+        from config import require_gemini_key
+
+        self.client = genai.Client(api_key=require_gemini_key())
         self.model = model
         self.name = f"gemini:{model}" + ("" if constrained else ":unconstrained")
         self.constrained = constrained
