@@ -282,13 +282,18 @@ quota resets and it continues where it stopped, at zero cost for work already
 done.
 
 ```bash
-cp project.env.example .env && $EDITOR .env    # GOOGLE_API_KEY, HF_USER
-export $(grep -v '^#' .env | xargs)
+cp project.env.example .env && $EDITOR .env    # paste GOOGLE_API_KEY
 
 make label-gold    # phase 1: 1,250 postings x 3 samples, self-consistency voted
 make label-bulk    # phase 2: 4,000 postings x 1 sample, --exclude-from phase 1
 make prepare       # dedup-aware grouped split; voted labels fill val/test first
 ```
+
+`.env` is read automatically by [`config.py`](config.py) — no `export` needed.
+Real environment variables still win over the file, so CI and Kaggle secret
+injection work unchanged, and `GOOGLE_API_KEY=... make label-gold` overrides it
+for a single run. An unedited `.env` reads as *no key* rather than sending a
+placeholder and getting a confusing 401.
 
 Phase order is not optional. Phase 2 draws a larger corpus slice that *contains*
 phase 1's, and `--exclude-from` is what stops the overlap being labeled twice —
