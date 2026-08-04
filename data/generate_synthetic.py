@@ -78,13 +78,24 @@ LOGGER = logging.getLogger("teacher")
 
 DEFAULT_MODEL = "gemini-2.0-flash"
 
-#: Default OpenRouter slug. Deliberately the same underlying model family as the
-#: Gemini path: if you label part of the corpus through one transport and part
-#: through the other, matching the model keeps the label distribution comparable.
-#: Switching model families mid-corpus does not -- it puts a systematic
-#: annotator difference between the training slice and the held-out slice, which
-#: is indistinguishable from the student underfitting.
-DEFAULT_OPENROUTER_MODEL = "google/gemini-2.0-flash-exp:free"
+#: Default OpenRouter slug. Deliberately the same model family as the Gemini
+#: path: if you label part of the corpus through one transport and part through
+#: the other, matching the model keeps the label distribution comparable.
+#: Switching model families mid-corpus does not -- it puts a systematic annotator
+#: difference between the training slice and the held-out slice, which is
+#: indistinguishable from the student underfitting.
+#:
+#: Measured on 29 real postings through this exact code path: 28/29 produced
+#: schema-valid output (the one failure was a transient provider error, not
+#: truncation -- every response finished with `stop`, longest was 525 tokens
+#: against a 1024 cap). Usage averaged 1,080 input / 373 output tokens per call.
+#:
+#: NOTE: model slugs get retired. `google/gemini-2.0-flash-001` and the
+#: `-exp:free` variant were both gone from the catalog by the time this was
+#: wired up, and a dead slug fails as `404 No endpoints found` rather than
+#: anything that names the real problem. Check a slug against
+#: https://openrouter.ai/api/v1/models before assuming it still exists.
+DEFAULT_OPENROUTER_MODEL = "google/gemini-2.5-flash-lite"
 
 #: (requests_per_minute, requests_per_day) per teacher, used when the CLI flags
 #: are left unset. These are *starting points*, not guarantees -- free-tier
@@ -97,6 +108,38 @@ DEFAULT_BUDGETS: dict[str, tuple[int, int]] = {
     "openrouter": (20, 50),
     "mock": (10_000, 10_000_000),
 }
+
+#: Built-in model per transport, used when neither the flag nor $TEACHER_MODEL
+#: is set.
+DEFAULT_MODELS: dict[str, str] = {
+    "gemini": DEFAULT_MODEL,
+    "openrouter": DEFAULT_OPENROUTER_MODEL,
+    "mock": "mock",
+}
+
+
+def resolve_teacher(
+    cli_teacher: str | None = None, cli_model: str | None = None
+) -> tuple[str, str]:
+    """Settle (transport, model) from flag > .env > built-in.
+
+    Which teacher you use is an account-level fact, like the budget: it belongs
+    in `.env` rather than on every invocation of a run that spans hours or days.
+    Factored out of `main` so the precedence can be tested without paying for a
+    corpus load, which is where every other resolution bug in this file hid.
+
+    Raises ValueError on an unknown transport rather than defaulting, so a typo
+    in `.env` cannot silently route a paid run through the wrong vendor.
+    """
+    from config import get_api_key
+
+    teacher = cli_teacher or get_api_key("TEACHER") or "gemini"
+    if teacher not in DEFAULT_BUDGETS:
+        raise ValueError(
+            f"unknown teacher {teacher!r}; expected one of {sorted(DEFAULT_BUDGETS)}"
+        )
+    model = cli_model or get_api_key("TEACHER_MODEL") or DEFAULT_MODELS[teacher]
+    return teacher, model
 
 
 # ===========================================================================
@@ -668,9 +711,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="cap rows scanned from the source dataset (smoke tests / CI only)")
     ap.add_argument("--out", type=Path, default=Path("data/interim/labeled.jsonl"))
     ap.add_argument("--cache", type=Path, default=Path("data/interim/teacher_cache.jsonl"))
-    ap.add_argument("--teacher", choices=["gemini", "openrouter", "mock"], default="gemini")
+    # Both default to None so the resolution order below can distinguish "not
+    # given" from "given". Which teacher you use is an account-level fact, like
+    # the budget, so it belongs in .env rather than on every invocation of a run
+    # that spans days.  Precedence: CLI flag > .env > built-in.
+    ap.add_argument("--teacher", choices=["gemini", "openrouter", "mock"], default=None,
+                    help="transport; defaults to $TEACHER, else gemini")
     ap.add_argument("--teacher-model", default=None,
-                    help="model id; defaults to the right one for --teacher")
+                    help="model id; defaults to $TEACHER_MODEL, else per-teacher default")
     ap.add_argument("--no-structured-output", action="store_true",
                     help="openrouter only: drop the json_schema constraint. Widens model "
                          "choice at the cost of guaranteed-valid JSON -- expect parse losses")
@@ -690,19 +738,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--audit-out", type=Path, default=Path("results/label_audit.md"))
     args = ap.parse_args(argv)
 
-    # Validate arguments BEFORE the corpus load. A flag that silently does
-    # nothing is how a run ends up believing it tested the unconstrained path
-    # when it did not -- and rejecting it down at teacher construction would
-    # charge the user a multi-minute dataset fetch to learn about a typo.
+    # Resolve and validate BEFORE the corpus load, for two reasons. A flag that
+    # silently does nothing is how a run ends up believing it tested the
+    # unconstrained path when it did not, and rejecting it down at teacher
+    # construction would charge a multi-minute dataset fetch to learn about a
+    # typo. setup_run() must also land here rather than later: HF_TOKEN has to be
+    # in os.environ before the Hub client initializes, or the download runs
+    # anonymously despite a valid token being present.
+    from config import setup_run
+
+    setup_run()
+    try:
+        args.teacher, teacher_model = resolve_teacher(args.teacher, args.teacher_model)
+    except ValueError as exc:
+        ap.error(str(exc))
     if args.no_structured_output and args.teacher != "openrouter":
         ap.error("--no-structured-output applies only to --teacher openrouter")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # Before load_corpus: HF_TOKEN must be in os.environ prior to the Hub client
-    # initializing, or the download runs anonymously despite a valid token.
-    from config import setup_run
-
-    setup_run()
     random.seed(args.seed)
 
     postings = load_corpus(args.n, seed=args.seed, max_rows=args.max_corpus_rows)
@@ -721,11 +774,6 @@ def main(argv: list[str] | None = None) -> int:
         requests_per_day=args.requests_per_day or get_int("REQUESTS_PER_DAY") or default_rpd,
     )
     teacher: TeacherFn
-    teacher_model = args.teacher_model or {
-        "gemini": DEFAULT_MODEL,
-        "openrouter": DEFAULT_OPENROUTER_MODEL,
-        "mock": "mock",
-    }[args.teacher]
     LOGGER.info(
         "teacher=%s model=%s budget=%d/min %d/day",
         args.teacher, teacher_model, budget.requests_per_minute, budget.requests_per_day,

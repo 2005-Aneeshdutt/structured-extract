@@ -11,8 +11,18 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from data.corpus import RawPosting
-from data.generate_synthetic import DEFAULT_BUDGETS, ResponseCache, label_posting, vote
+from data.generate_synthetic import (
+    DEFAULT_BUDGETS,
+    DEFAULT_MODELS,
+    DEFAULT_OPENROUTER_MODEL,
+    ResponseCache,
+    label_posting,
+    resolve_teacher,
+    vote,
+)
 from data.schema import (
     JobPosting,
     Location,
@@ -146,6 +156,45 @@ class TestBudgetDefaults:
         """Free-tier cap is credit-gated; overshooting it costs a run of 429s."""
         _rpm, rpd = DEFAULT_BUDGETS["openrouter"]
         assert rpd < DEFAULT_BUDGETS["gemini"][1]
+
+    def test_every_teacher_has_a_default_model(self):
+        assert set(DEFAULT_MODELS) == set(DEFAULT_BUDGETS)
+
+
+class TestTeacherResolution:
+    """flag > .env > built-in. Every previous resolution bug in this module hid
+    behind a corpus load, so this is tested directly."""
+
+    @pytest.fixture(autouse=True)
+    def _clear(self, monkeypatch):
+        import config
+
+        monkeypatch.setattr(config, "_loaded", True)  # skip reading a real .env
+        for var in ("TEACHER", "TEACHER_MODEL"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_built_in_default_is_gemini(self):
+        assert resolve_teacher() == ("gemini", DEFAULT_MODELS["gemini"])
+
+    def test_env_selects_the_transport_and_its_default_model(self, monkeypatch):
+        monkeypatch.setenv("TEACHER", "openrouter")
+        assert resolve_teacher() == ("openrouter", DEFAULT_OPENROUTER_MODEL)
+
+    def test_env_can_pin_the_model(self, monkeypatch):
+        monkeypatch.setenv("TEACHER", "openrouter")
+        monkeypatch.setenv("TEACHER_MODEL", "qwen/qwen3-30b-a3b-instruct-2507")
+        assert resolve_teacher() == ("openrouter", "qwen/qwen3-30b-a3b-instruct-2507")
+
+    def test_cli_beats_env(self, monkeypatch):
+        monkeypatch.setenv("TEACHER", "openrouter")
+        monkeypatch.setenv("TEACHER_MODEL", "from-env")
+        assert resolve_teacher("mock", "from-cli") == ("mock", "from-cli")
+
+    def test_unknown_transport_raises_rather_than_defaulting(self, monkeypatch):
+        """A typo in .env must not silently route a PAID run through gemini."""
+        monkeypatch.setenv("TEACHER", "openrotuer")
+        with pytest.raises(ValueError, match="unknown teacher"):
+            resolve_teacher()
 
 
 class TestVoting:

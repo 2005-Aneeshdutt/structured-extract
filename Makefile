@@ -54,19 +54,20 @@ smoke:  ## End-to-end data pipeline on 250 postings with the mock teacher (no AP
 # quota resets and it picks up exactly where it stopped, at zero cost for work
 # already done.
 # ---------------------------------------------------------------------------
-# Teacher transport for both labeling phases. `gemini` (default) has the larger
-# free tier; `openrouter` swaps the vendor without touching the protocol:
-#     make label-gold TEACHER=openrouter TEACHER_ARGS="--requests-per-day 1000"
-TEACHER ?= gemini
+# Teacher transport resolves from $TEACHER in .env (default: gemini), so a
+# multi-day run does not depend on remembering a flag. Override per-invocation:
+#     make label-gold TEACHER_ARGS="--teacher openrouter"
 TEACHER_ARGS ?=
 
 label-gold:  ## PHASE 1 — held-out labels, 3-sample self-consistency vote (run this first)
-	$(PY) -m data.generate_synthetic --n 1250 --teacher $(TEACHER) --n-samples 3 \
+	$(PY) -m data.generate_synthetic --n 1000 --n-samples 3 \
 		--out data/interim/labeled_gold.jsonl \
 		--audit-out results/label_audit.md $(TEACHER_ARGS)
 
+# --n is the CORPUS SLICE, not the count of new labels: phase 1's postings sit
+# inside it and are skipped via --exclude-from. 4225 - 1000 = 3225 new labels.
 label-bulk:  ## PHASE 2 — training labels, single greedy pass, skipping phase-1 postings
-	$(PY) -m data.generate_synthetic --n 5250 --teacher $(TEACHER) --n-samples 1 \
+	$(PY) -m data.generate_synthetic --n 4225 --n-samples 1 \
 		--exclude-from data/interim/labeled_gold.jsonl \
 		--out data/interim/labeled.jsonl \
 		--audit-out results/label_audit_bulk.md $(TEACHER_ARGS)
