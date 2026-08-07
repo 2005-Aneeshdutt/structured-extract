@@ -369,6 +369,17 @@ class TestFailureIsolation:
             _reject_if_unusable('{\n  "job_', structured=True, finish="stop")
         assert not isinstance(exc.value, TeacherRefusal)
 
+    def test_schema_invalid_json_is_permanent_not_transient(self):
+        """Well-formed JSON our validators reject repeats identically at temp 0.
+
+        `_sane_magnitude` refusing an absurd salary is a verdict about the
+        content, not a transport accident, so retrying spends four more calls to
+        be told the same thing.
+        """
+        absurd = '{"job_title":"Eng","salary":{"min_amount":9.9e12}}'
+        with pytest.raises(TeacherRefusal):
+            _reject_if_unusable(absurd, structured=True, finish="stop")
+
     def test_valid_completion_passes(self):
         good = to_target_json(JobPosting(job_title="Engineer"))
         _reject_if_unusable(good, structured=True, finish="stop")

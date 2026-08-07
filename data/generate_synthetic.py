@@ -376,11 +376,17 @@ def _reject_if_unusable(content: str, *, structured: bool, finish: str | None = 
         raise TeacherRefusal(f"incomplete completion (finish_reason={finish!r})")
     obj, reason = parse_prediction(content)
     if obj is None:
-        # No finish_reason complaint but still unparseable => the stream was cut
-        # mid-token by the transport. That IS transient, so let tenacity retry.
-        raise RuntimeError(
-            f"unusable completion ({reason}), {len(content)} chars: {content[:120]!r}"
-        )
+        detail = f"({reason}), {len(content)} chars: {content[:120]!r}"
+        if str(reason).startswith("schema_error"):
+            # Well-formed JSON that our validators reject -- e.g. a salary
+            # magnitude `_sane_magnitude` refuses. The transport worked; the
+            # CONTENT is wrong, and at temperature 0 an identical request
+            # returns identical content. Retrying spends four more calls to be
+            # told the same thing, so this is a verdict about the posting.
+            raise TeacherRefusal(f"schema-invalid completion {detail}")
+        # no_json / json_decode_error with finish_reason=stop means the stream
+        # was cut mid-token by the transport. That IS worth another attempt.
+        raise RuntimeError(f"unusable completion {detail}")
 
 
 class OpenRouterTeacher:
