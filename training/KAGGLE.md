@@ -48,7 +48,7 @@ the code.
 ```python
 # Do NOT install torch. Kaggle's image ships a torch built against its exact CUDA
 # runtime; replacing it from PyPI breaks the driver match and costs the session.
-!pip -q install "trl>=0.9,<0.12" peft bitsandbytes wandb accelerate
+!pip -q install "trl>=0.9,<0.12" "transformers>=4.44,<5" peft bitsandbytes wandb accelerate
 ```
 
 Then **restart the kernel** before training — pip cannot rebind modules already
@@ -63,10 +63,17 @@ imported in the session.
 > slower. Budget 2-4 h per rank rather than 1-2 h, and plan for one rank per
 > session.
 
-`trl<0.12` is load-bearing, not caution: 0.12 renamed `tokenizer` to
-`processing_class`, and later versions dropped `DataCollatorForCompletionOnlyLM`
-entirely. `assert_trl_api()` checks this in the first five seconds rather than
-letting it surface as a TypeError twenty minutes in.
+Both pins are load-bearing, and they constrain *different* things:
+
+- `trl<0.12` — 0.12 renamed `tokenizer` to `processing_class`, and later
+  versions dropped `DataCollatorForCompletionOnlyLM`, which is what masks loss
+  to the assistant turn.
+- `transformers<5` — TRL 0.9-0.11 forward `tokenizer=` down to
+  `transformers.Trainer`, and **v5 renamed that parameter**. Kaggle's image
+  ships transformers 5.x, so pinning TRL alone still type-errors inside
+  `SFTTrainer.__init__`, twenty minutes in, after the model has loaded.
+
+`assert_trl_api()` checks both in the first five seconds.
 
 ## Cell 4 — train one rank
 

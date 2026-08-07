@@ -274,6 +274,21 @@ def assert_trl_api() -> None:
             "(Or port the SFTTrainer call to SFTConfig + assistant_only_loss for newer TRL.)"
         ) from e
 
+    # TRL 0.9-0.11 forward `tokenizer=` down to transformers.Trainer. transformers
+    # v5 renamed that parameter to `processing_class`, so a new-enough
+    # transformers with an old-enough TRL type-errors INSIDE SFTTrainer.__init__
+    # -- after the model has loaded, which is the 20-minute failure this function
+    # exists to prevent. The TRL pin alone does not constrain it.
+    import transformers
+
+    if "tokenizer" not in inspect.signature(transformers.Trainer.__init__).parameters:
+        raise SystemExit(
+            f"transformers {transformers.__version__} dropped `Trainer(tokenizer=...)`, "
+            f"but trl {version} still passes it.\n"
+            "Fix:  pip install 'transformers>=4.44,<5'\n"
+            "(Then restart the kernel -- pip cannot rebind an imported module.)"
+        )
+
     params = inspect.signature(trl.SFTTrainer.__init__).parameters
     missing = [p for p in ("tokenizer", "max_seq_length") if p not in params]
     if missing:
