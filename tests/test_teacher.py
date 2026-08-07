@@ -18,7 +18,11 @@ from data.generate_synthetic import (
     DEFAULT_BUDGETS,
     DEFAULT_MODELS,
     DEFAULT_OPENROUTER_MODEL,
+    Budget,
+    BudgetExhausted,
     ResponseCache,
+    TeacherRefusal,
+    _reject_if_unusable,
     label_posting,
     resolve_teacher,
     vote,
@@ -314,6 +318,45 @@ class TestSetValuedVoting:
         voted, agreement = vote(samples)
         assert voted is not None and voted.years_experience_min == 5
         assert agreement["years_experience_min"] == 2 / 3
+
+
+class TestFailureIsolation:
+    """One posting the teacher cannot handle must not end the run.
+
+    Regression: the loop caught bare RuntimeError to stop on an exhausted daily
+    budget. When the teacher began raising RuntimeError for per-posting problems
+    too, the first unusable completion broke the loop and exited 0 -- a
+    1,010-posting phase stopped after 26 and reported success.
+    """
+
+    def test_budget_exhaustion_is_its_own_type(self):
+        assert issubclass(BudgetExhausted, RuntimeError)
+        assert not issubclass(TeacherRefusal, BudgetExhausted)
+
+    def test_budget_take_raises_the_stopping_type(self):
+        b = Budget(requests_per_minute=100, requests_per_day=1)
+        b.take()
+        with pytest.raises(BudgetExhausted):
+            b.take()
+
+    def test_length_capped_completion_is_permanent_not_transient(self):
+        """finish_reason='length' at temperature 0 repeats identically."""
+        with pytest.raises(TeacherRefusal):
+            _reject_if_unusable('{"job_title": "Eng"', structured=True, finish="length")
+
+    def test_truncated_stream_is_transient_so_it_can_be_retried(self):
+        """A cut stream is a network accident -- retryable, and NOT a refusal."""
+        with pytest.raises(RuntimeError) as exc:
+            _reject_if_unusable('{\n  "job_', structured=True, finish="stop")
+        assert not isinstance(exc.value, TeacherRefusal)
+
+    def test_valid_completion_passes(self):
+        good = to_target_json(JobPosting(job_title="Engineer"))
+        _reject_if_unusable(good, structured=True, finish="stop")
+
+    def test_unstructured_mode_accepts_anything(self):
+        """There the caller has explicitly opted into parse failures."""
+        _reject_if_unusable("not json at all", structured=False, finish="stop")
 
 
 class TestLabelFunnel:

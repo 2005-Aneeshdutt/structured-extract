@@ -149,6 +149,28 @@ def resolve_teacher(
 # ===========================================================================
 
 
+class BudgetExhausted(RuntimeError):
+    """The daily request ceiling is gone. The ONLY reason to end a run early.
+
+    A distinct type because the labeling loop stops on it, and it used to be
+    signalled by a bare RuntimeError. Once the teacher started raising
+    RuntimeError for per-posting problems too, a single unusable completion
+    ended the whole run and exited 0 -- a 1,010-posting phase stopped after 26
+    and reported success. One bad posting must never be able to do that.
+    """
+
+
+class TeacherRefusal(Exception):
+    """This posting cannot be labeled by this model. Do not retry, do not cache.
+
+    Separate from a transient fault because the retry policy differs and getting
+    that wrong is expensive in both directions. A truncated *stream* is worth
+    retrying -- it is a network accident. Hitting `max_tokens` at temperature 0
+    is not: the model will produce the identical too-long completion five times,
+    burning five calls to learn what the first one already said.
+    """
+
+
 @dataclass
 class Budget:
     """Free-tier accounting.
@@ -172,7 +194,7 @@ class Budget:
 
     def take(self) -> None:
         if self._spent >= self.requests_per_day:
-            raise RuntimeError(
+            raise BudgetExhausted(
                 f"daily budget of {self.requests_per_day} requests exhausted. "
                 "Re-run tomorrow -- the cache makes this resumable and free."
             )
@@ -275,7 +297,12 @@ class GeminiTeacher:
 
     def __call__(self, posting_text: str, temperature: float = 0.0, sample_idx: int = 0) -> str:
         from google.genai import types
-        from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+        from tenacity import (
+            retry,
+            retry_if_not_exception_type,
+            stop_after_attempt,
+            wait_exponential,
+        )
 
         prompt = build_user_prompt(posting_text)
         ck = ResponseCache.key(self.model, temperature, prompt, sample_idx)
@@ -286,7 +313,9 @@ class GeminiTeacher:
             # 429 (quota) and 503 (overloaded) are the two failure modes on the
             # free tier. Exponential backoff to 60s; beyond 5 attempts the daily
             # quota is genuinely gone and retrying just burns wall clock.
-            retry=retry_if_exception_type(Exception),
+            # Retry anything EXCEPT the two verdicts that will not change:
+            # a permanent refusal for this posting, and an exhausted daily quota.
+            retry=retry_if_not_exception_type((TeacherRefusal, BudgetExhausted)),
             wait=wait_exponential(multiplier=2, min=2, max=60),
             stop=stop_after_attempt(5),
             reraise=True,
@@ -301,7 +330,7 @@ class GeminiTeacher:
                     response_mime_type="application/json",
                     response_schema=self._schema,
                     temperature=temperature,
-                    max_output_tokens=1024,
+                    max_output_tokens=2048,  # see the OpenRouter payload for why
                 ),
             )
             text = resp.text or ""
@@ -341,10 +370,14 @@ def _reject_if_unusable(content: str, *, structured: bool, finish: str | None = 
     if not structured:
         return
     if finish and finish not in ("stop", "STOP", None):
-        # length/content_filter/error - not a complete answer, do not cache it.
-        raise RuntimeError(f"incomplete completion (finish_reason={finish!r})")
+        # Ran out of output budget (or was filtered). Deterministic at
+        # temperature 0, so retrying spends four more calls to be told the same
+        # thing. Permanent for this posting; the run continues without it.
+        raise TeacherRefusal(f"incomplete completion (finish_reason={finish!r})")
     obj, reason = parse_prediction(content)
     if obj is None:
+        # No finish_reason complaint but still unparseable => the stream was cut
+        # mid-token by the transport. That IS transient, so let tenacity retry.
         raise RuntimeError(
             f"unusable completion ({reason}), {len(content)} chars: {content[:120]!r}"
         )
@@ -418,7 +451,13 @@ class OpenRouterTeacher:
                 {"role": "user", "content": prompt},
             ],
             "temperature": temperature,
-            "max_tokens": 1024,
+            # 1024 was set from a p95 completion of ~525 tokens on an 8-posting
+            # sample, which simply did not contain the tail of the distribution.
+            # In the real run, postings with long skill/benefit lists hit the cap
+            # and came back finish_reason='length'. Doubling costs nothing on a
+            # typical call -- output tokens are billed as generated, not as
+            # reserved -- and only the rare long extraction uses the headroom.
+            "max_tokens": 2048,
         }
         if self._response_format is not None:
             body["response_format"] = self._response_format
@@ -428,7 +467,12 @@ class OpenRouterTeacher:
         return body
 
     def __call__(self, posting_text: str, temperature: float = 0.0, sample_idx: int = 0) -> str:
-        from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+        from tenacity import (
+            retry,
+            retry_if_not_exception_type,
+            stop_after_attempt,
+            wait_exponential,
+        )
 
         prompt = build_user_prompt(posting_text)
         ck = ResponseCache.key(self.model, temperature, prompt, sample_idx)
@@ -436,7 +480,9 @@ class OpenRouterTeacher:
             return hit
 
         @retry(
-            retry=retry_if_exception_type(Exception),
+            # Retry anything EXCEPT the two verdicts that will not change:
+            # a permanent refusal for this posting, and an exhausted daily quota.
+            retry=retry_if_not_exception_type((TeacherRefusal, BudgetExhausted)),
             wait=wait_exponential(multiplier=2, min=2, max=60),
             stop=stop_after_attempt(5),
             reraise=True,
@@ -939,9 +985,19 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             try:
                 rec = label_posting(p, teacher, n_samples=args.n_samples, temperature=args.temperature)
-            except RuntimeError as e:  # daily budget exhausted -- stop cleanly
+            except BudgetExhausted as e:
+                # The only condition that should end a run. Everything already
+                # written stays; the cache makes tomorrow's rerun free.
                 LOGGER.warning("stopping early: %s", e)
                 break
+            except Exception as e:
+                # One posting the teacher could not handle, after retries. Record
+                # it and carry on. This used to share the branch above, so a
+                # single unusable completion ended a 1,010-posting run after 26
+                # and exited 0 -- a silent 97% data loss reported as success.
+                LOGGER.warning("posting %s failed: %s", p.posting_id, e)
+                rec = {"posting_id": p.posting_id, "source_text": p.text,
+                       "platform": p.platform, "status": "api_failed"}
             statuses[rec["status"]] += 1
             if rec["status"] == "ok":
                 ok_records.append(rec)
