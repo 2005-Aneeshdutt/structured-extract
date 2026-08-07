@@ -285,8 +285,13 @@ def assert_trl_api() -> None:
         raise SystemExit(
             f"transformers {transformers.__version__} dropped `Trainer(tokenizer=...)`, "
             f"but trl {version} still passes it.\n"
-            "Fix:  pip install 'transformers>=4.44,<5'\n"
-            "(Then restart the kernel -- pip cannot rebind an imported module.)"
+            "Fix:  pip install 'transformers>=4.45,<4.47'\n"
+            "(Then RESTART the kernel -- pip cannot rebind an imported module.)\n"
+            "\n"
+            "Note the narrow window: `tokenizer` was deprecated in 4.46 in favour of\n"
+            "`processing_class` and removed during the 4.5x line -- NOT at 5.0 as the\n"
+            "deprecation notice said -- so a `<5` pin does not exclude the versions\n"
+            "that dropped it. 4.46.x is the last release TRL 0.11 works against."
         )
 
     params = inspect.signature(trl.SFTTrainer.__init__).parameters
