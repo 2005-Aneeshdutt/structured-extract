@@ -48,6 +48,21 @@ from typing import Any
 
 LOGGER = logging.getLogger("train")
 
+# Pin to ONE GPU before torch initializes CUDA.
+#
+# Kaggle's "GPU T4 x2" option -- which KAGGLE.md tells you to pick, because it is
+# how you get a T4 rather than a P100 -- exposes two devices. transformers.Trainer
+# sees >1 and silently wraps the model in nn.DataParallel, which then tries to
+# scatter the batch across both. That fails for a 4-bit model: bitsandbytes
+# Params4bit carry quantization state that DataParallel cannot replicate, and it
+# surfaces deep inside torch/nn/parallel/scatter_gather.py with no mention of
+# quantization, GPUs, or anything you would search for.
+#
+# Single-GPU is the design, not a workaround: every VRAM figure, batch size and
+# gradient-accumulation setting here is sized for one 16 GB T4. Set explicitly
+# rather than left to chance, and only if the caller has not chosen already.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
 REPO_URL = os.environ.get("STRUCTURED_EXTRACT_REPO", "https://github.com/2005-Aneeshdutt/structured-extract")
 
 
