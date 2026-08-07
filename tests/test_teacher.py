@@ -174,6 +174,25 @@ class TestOpenAISchemaTranslation:
         assert None in emp["enum"]
         assert "full_time" in emp["enum"]
 
+    def test_array_caps_survive_translation(self):
+        """maxItems bounds a repetition loop; losing it in translation is silent.
+
+        Without it the grammar admits an infinite document: a model that slips
+        into repeating one token has no legal stop until it closes the array.
+        Observed for real -- "schedules" x8,192 tokens, 23KB, 13x cost,
+        unparseable. The Gemini path would be protected and the OpenRouter path
+        exposed, and the symptom looks nothing like a translation bug.
+        """
+        props = self._schema()["properties"]
+        assert props["required_skills"]["maxItems"] == 15
+        assert props["preferred_skills"]["maxItems"] == 10
+        assert props["benefits"]["maxItems"] == 10
+
+    def test_gemini_schema_also_caps_arrays(self):
+        props = gemini_response_schema()["properties"]
+        assert props["required_skills"]["maxItems"] == 15
+        assert props["benefits"]["maxItems"] == 10
+
     def test_nested_objects_are_translated_too(self):
         loc = self._schema()["properties"]["location"]
         assert loc["additionalProperties"] is False

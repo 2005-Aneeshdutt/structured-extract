@@ -330,7 +330,7 @@ class GeminiTeacher:
                     response_mime_type="application/json",
                     response_schema=self._schema,
                     temperature=temperature,
-                    max_output_tokens=2048,  # see the OpenRouter payload for why
+                    max_output_tokens=1024,  # see the OpenRouter payload for why
                 ),
             )
             text = resp.text or ""
@@ -451,13 +451,15 @@ class OpenRouterTeacher:
                 {"role": "user", "content": prompt},
             ],
             "temperature": temperature,
-            # 1024 was set from a p95 completion of ~525 tokens on an 8-posting
-            # sample, which simply did not contain the tail of the distribution.
-            # In the real run, postings with long skill/benefit lists hit the cap
-            # and came back finish_reason='length'. Doubling costs nothing on a
-            # typical call -- output tokens are billed as generated, not as
-            # reserved -- and only the rare long extraction uses the headroom.
-            "max_tokens": 2048,
+            # Sized from measurement: completions run ~373 tokens on average and
+            # 525 at the top of a 29-posting sample, so 1024 is ~2x headroom.
+            #
+            # It was briefly raised to 2048 on the theory that `length` failures
+            # were long-but-legitimate extractions. They were not -- they were
+            # repetition loops, and the real fix is maxItems in the schema, which
+            # bounds the array so the loop cannot start. Raising the ceiling only
+            # buys more of the same garbage at proportionally more cost.
+            "max_tokens": 1024,
         }
         if self._response_format is not None:
             body["response_format"] = self._response_format

@@ -674,9 +674,22 @@ def gemini_response_schema() -> dict[str, Any]:
             ),
             "years_experience_min": s("integer", nullable=True),
             "application_deadline": s("string", nullable=True),
-            "required_skills": s("array", items=s("string")),
-            "preferred_skills": s("array", items=s("string")),
-            "benefits": s("array", items=s("string")),
+            # maxItems is load-bearing, not documentation. Without it the
+            # grammar permits an unbounded array, so a model that slips into a
+            # repetition loop has NO legal stopping token until it chooses to
+            # close the array -- and it does not. Observed on a real posting:
+            # "schedules" repeated for 8,192 tokens, 23KB of output, 13x the
+            # cost of a normal call, and unparseable at the end of it.
+            # Constrained decoding guarantees shape, and an unbounded array is a
+            # shape that admits an infinite document.
+            #
+            # Caps match the field descriptions, which previously said "Max 15"
+            # only in prose the model never saw -- descriptions are not part of
+            # this hand-built schema. Verified enforced by the provider:
+            # finish_reason went length -> stop, 8192 -> 388 completion tokens.
+            "required_skills": s("array", items=s("string"), maxItems=15),
+            "preferred_skills": s("array", items=s("string"), maxItems=10),
+            "benefits": s("array", items=s("string"), maxItems=10),
         },
         required=list(JobPosting.model_fields.keys()),
         # propertyOrdering pins generation order to our canonical field order so
@@ -727,6 +740,13 @@ def _strict_json_schema(node: dict[str, Any]) -> dict[str, Any]:
         out["additionalProperties"] = False
     elif node_type == "array":
         out["items"] = _strict_json_schema(node["items"])
+        # Carried across deliberately: this is the keyword that bounds a
+        # repetition loop, so dropping it in translation would leave the
+        # OpenRouter path exposed to the failure the Gemini path is protected
+        # from -- and the symptom (a 23KB reply of one repeated word) looks
+        # nothing like a schema-translation bug.
+        if "maxItems" in node:
+            out["maxItems"] = node["maxItems"]
 
     return out
 
