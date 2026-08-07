@@ -36,6 +36,7 @@ from typing import Any
 from data.corpus import RawPosting, _shingles, stratum_of
 from data.schema import (
     FIELD_SPECS,
+    LIST_CAPS,
     JobPosting,
     build_messages,
     flatten,
@@ -71,8 +72,13 @@ def is_degenerate(obj: JobPosting) -> str | None:
         return "degenerate_all_null"
     if len(obj.job_title) < 3:
         return "title_too_short"
-    if len(obj.required_skills) > 15 or len(obj.benefits) > 10:
-        return "list_overflow"  # should be impossible post-validation; belt and braces
+    # Genuinely unreachable now that the validator truncates to LIST_CAPS -- it
+    # is kept as an assertion that it stays that way. It was NOT unreachable
+    # before: the validator canonicalized without passing `limit`, so this
+    # branch quietly deleted 486 records (11.5% of the corpus), taking every
+    # other correctly-extracted field on those postings with them.
+    if any(len(getattr(obj, f)) > cap for f, cap in LIST_CAPS.items()):
+        return "list_overflow"
     return None
 
 

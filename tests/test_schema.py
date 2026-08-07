@@ -14,6 +14,7 @@ import pytest
 
 from data.schema import (
     FIELD_SPECS,
+    LIST_CAPS,
     EmploymentType,
     JobPosting,
     Location,
@@ -200,6 +201,32 @@ class TestGrounding:
                        salary=Salary(min_amount=120000), years_experience_min=5,
                        required_skills=["python"])
         assert ungrounded_fields(obj, self.SOURCE) == []
+
+    def test_lists_are_truncated_to_the_documented_cap(self):
+        """The cap was asserted in three places and enforced in none.
+
+        Field descriptions said "Max 15", canonicalize_terms accepted a `limit`,
+        and prepare_dataset rejected overflow as "should be impossible
+        post-validation". The validator never passed the limit, so that branch
+        deleted 486 records -- 11.5% of the corpus -- discarding every other
+        correctly-extracted field on those postings along with the long list.
+        """
+        obj = _minimal(required_skills=[f"skill{i:03d}" for i in range(40)],
+                       preferred_skills=[f"pref{i:03d}" for i in range(40)],
+                       benefits=[f"benefit{i:03d}" for i in range(40)])
+        assert len(obj.required_skills) == LIST_CAPS["required_skills"] == 15
+        assert len(obj.preferred_skills) == LIST_CAPS["preferred_skills"] == 10
+        assert len(obj.benefits) == LIST_CAPS["benefits"] == 10
+
+    def test_cap_is_shared_with_the_grammar(self):
+        """Validator and schema must read the same number or they drift apart."""
+        props = gemini_response_schema()["properties"]
+        for field, cap in LIST_CAPS.items():
+            assert props[field]["maxItems"] == cap
+
+    def test_short_lists_are_untouched(self):
+        obj = _minimal(required_skills=["python", "sql"])
+        assert obj.required_skills == ["python", "sql"]
 
     def test_region_is_canonicalized_on_construction(self):
         """Measured: 31.6% of gold labels wrote 'Texas', 68.4% wrote 'TX'.

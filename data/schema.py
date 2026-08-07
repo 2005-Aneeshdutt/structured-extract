@@ -22,9 +22,21 @@ import re
 from enum import Enum
 from typing import Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 SCHEMA_VERSION: Final = "1.0.0"
+
+#: Maximum items per list field. ONE definition, consumed by three places that
+#: previously each carried their own copy of the number (or, worse, only a
+#: sentence about it): the pydantic validator that truncates, the JSON schema
+#: `maxItems` that stops the model generating past it, and the quality filter
+#: that rejects overflow. When those drifted, the grammar allowed what the
+#: validator would not produce and the filter silently deleted the difference.
+LIST_CAPS: Final[dict[str, int]] = {
+    "required_skills": 15,
+    "preferred_skills": 10,
+    "benefits": 10,
+}
 
 # ---------------------------------------------------------------------------
 # Controlled vocabularies
@@ -302,8 +314,14 @@ class JobPosting(BaseModel):
 
     @field_validator("required_skills", "preferred_skills", "benefits")
     @classmethod
-    def _canonical_list(cls, v: list[str]) -> list[str]:
-        return canonicalize_terms(v)
+    def _canonical_list(cls, v: list[str], info: ValidationInfo) -> list[str]:
+        # The `limit` was documented in three places and passed in none: the
+        # field descriptions say "Max 15", canonicalize_terms accepts a limit,
+        # and prepare_dataset rejects overflow with the comment "should be
+        # impossible post-validation". It fired 486 times -- 11.5% of the corpus
+        # discarded whole, every other field on those postings lost with it,
+        # because the one place that could enforce the cap did not.
+        return canonicalize_terms(v, limit=LIST_CAPS[info.field_name])
 
 
 # ---------------------------------------------------------------------------
@@ -709,9 +727,12 @@ def gemini_response_schema() -> dict[str, Any]:
             # Item maxLength matches canonicalize_terms, which already drops any
             # term over 40 chars -- so the grammar now refuses to generate what
             # the validator would silently discard.
-            "required_skills": s("array", items=s("string", maxLength=TERM), maxItems=15),
-            "preferred_skills": s("array", items=s("string", maxLength=TERM), maxItems=10),
-            "benefits": s("array", items=s("string", maxLength=TERM), maxItems=10),
+            "required_skills": s("array", items=s("string", maxLength=TERM),
+                                 maxItems=LIST_CAPS["required_skills"]),
+            "preferred_skills": s("array", items=s("string", maxLength=TERM),
+                                  maxItems=LIST_CAPS["preferred_skills"]),
+            "benefits": s("array", items=s("string", maxLength=TERM),
+                          maxItems=LIST_CAPS["benefits"]),
         },
         required=list(JobPosting.model_fields.keys()),
         # propertyOrdering pins generation order to our canonical field order so
