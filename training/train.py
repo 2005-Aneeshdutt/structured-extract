@@ -281,17 +281,25 @@ def assert_trl_api() -> None:
     # exists to prevent. The TRL pin alone does not constrain it.
     import transformers
 
-    if "tokenizer" not in inspect.signature(transformers.Trainer.__init__).parameters:
+    # Compared by VERSION, not by inspecting the signature. From 4.46 the
+    # `tokenizer` kwarg is accepted through a @deprecate_kwarg decorator, so it
+    # works at runtime but does NOT appear in
+    # `inspect.signature(Trainer.__init__)`. A signature check therefore rejects
+    # 4.46.x, which is precisely the version that does work -- a false alarm
+    # that blocks a valid setup is worse than no check at all.
+    from packaging.version import Version
+
+    tv = Version(transformers.__version__)
+    if tv >= Version("4.47"):
         raise SystemExit(
-            f"transformers {transformers.__version__} dropped `Trainer(tokenizer=...)`, "
-            f"but trl {version} still passes it.\n"
+            f"transformers {transformers.__version__} no longer accepts "
+            f"`Trainer(tokenizer=...)`, but trl {version} still passes it.\n"
             "Fix:  pip install 'transformers>=4.45,<4.47'\n"
             "(Then RESTART the kernel -- pip cannot rebind an imported module.)\n"
             "\n"
-            "Note the narrow window: `tokenizer` was deprecated in 4.46 in favour of\n"
-            "`processing_class` and removed during the 4.5x line -- NOT at 5.0 as the\n"
-            "deprecation notice said -- so a `<5` pin does not exclude the versions\n"
-            "that dropped it. 4.46.x is the last release TRL 0.11 works against."
+            "The window is narrow: the deprecation notice said `tokenizer` would be\n"
+            "removed at 5.0, but it went during the 4.5x line, so a `<5` pin does\n"
+            "not exclude the releases that dropped it."
         )
 
     params = inspect.signature(trl.SFTTrainer.__init__).parameters
