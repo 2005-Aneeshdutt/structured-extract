@@ -600,6 +600,41 @@ def main(argv: list[str] | None = None) -> int:
         )
     collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer)
 
+    def formatting_func(batch: Any) -> list[str]:
+        """Render `messages` through the tokenizer's chat template.
+
+        The dataset deliberately stores `messages` rather than a pre-rendered
+        string (see prepare_dataset.to_sft_record) so the ChatML format is not
+        baked into the data and swapping the base model cannot silently produce
+        mismatched formatting. That decision only holds if the training script
+        actually applies the template -- which it did not, so TRL had no way to
+        turn a row into text and refused to build the trainer.
+
+        Rendering HERE, from the tokenizer, is what keeps train-time and
+        eval-time prompts byte-identical: eval calls the same
+        `apply_chat_template` on the same `messages`. A hand-built f-string
+        would drift by a newline and quietly inflate the reported lift.
+
+        TRL maps with batched=True, so `batch["messages"]` is a list of
+        conversations; it also calls this on a single example in some paths, so
+        both shapes are handled.
+        """
+        conversations = batch["messages"]
+        if conversations and isinstance(conversations[0], dict):
+            conversations = [conversations]  # single example, not a batch
+        return [tokenizer.apply_chat_template(c, tokenize=False) for c in conversations]
+
+    # Assert the rendered text actually contains the string the collator masks
+    # on. If it does not, completion-only masking silently no-ops and the model
+    # trains on the schema card and the posting text as if they were targets --
+    # which looks like slow convergence, not like a bug.
+    _probe = formatting_func(train_ds[:1])[0]
+    if response_template not in _probe:
+        raise SystemExit(
+            f"rendered training text does not contain {response_template!r}; "
+            "completion-only masking would train on the prompt."
+        )
+
     targs = TrainingArguments(
         output_dir=str(run_dir),
         num_train_epochs=cfg.num_train_epochs,
@@ -642,6 +677,7 @@ def main(argv: list[str] | None = None) -> int:
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         max_seq_length=cfg.max_seq_length,
+        formatting_func=formatting_func,
         data_collator=collator,
         packing=False,
         args=targs,

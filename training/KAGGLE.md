@@ -48,12 +48,25 @@ the code.
 ```python
 # Do NOT install torch. Kaggle's image ships a torch built against its exact CUDA
 # runtime; replacing it from PyPI breaks the driver match and costs the session.
-!pip -q install "unsloth[cu121-torch230]" "trl<0.12" peft bitsandbytes wandb
+!pip -q install "trl>=0.9,<0.12" peft bitsandbytes wandb accelerate
 ```
 
-If the Unsloth wheel fails (it pins torch/CUDA combinations tightly and Kaggle
-rolls its base image periodically), skip it — `train.py` falls back to
-TRL + PEFT + bitsandbytes automatically. Same adapter, roughly 2x slower.
+Then **restart the kernel** before training — pip cannot rebind modules already
+imported in the session.
+
+> **Unsloth is deliberately not installed.** Its wheels pin an exact
+> torch/CUDA pair (`unsloth[cu121-torch230]` wants torch 2.3), and Kaggle's
+> image has moved on — it shipped **torch 2.10.0+cu128** as of the last run, so
+> that extra cannot resolve. Forcing it replaces torch and breaks the driver
+> match, which costs the whole session. `train.py` detects the absence and falls
+> back to TRL + PEFT + bitsandbytes: same adapter, same result, roughly 2x
+> slower. Budget 2-4 h per rank rather than 1-2 h, and plan for one rank per
+> session.
+
+`trl<0.12` is load-bearing, not caution: 0.12 renamed `tokenizer` to
+`processing_class`, and later versions dropped `DataCollatorForCompletionOnlyLM`
+entirely. `assert_trl_api()` checks this in the first five seconds rather than
+letting it surface as a TypeError twenty minutes in.
 
 ## Cell 4 — train one rank
 
@@ -68,7 +81,10 @@ TRL + PEFT + bitsandbytes automatically. Same adapter, roughly 2x slower.
 
 Watch the first 50 steps. Three things tell you it is healthy:
 
-- `trainable ... params (X%)` — should be ~0.6% at r=16 with attention+MLP targets
+- `trainable ... params (X%)` — **measured 2.04% at r=16** (18,464,768 of
+  907,081,216) with attention+MLP targets. The denominator is the 4-bit
+  quantized parameter count PEFT reports, not the 1.5B fp16 count, which is why
+  the percentage looks higher than the usual "<1% of the model" shorthand.
 - `peak N GB` from the memory callback — under ~13 GB leaves headroom
 - `GEN EVAL {'eval/schema_compliance': ...}` at step 50 — should already be
   well above the base model. If it is near zero at step 150, something is wrong
