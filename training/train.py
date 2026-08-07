@@ -59,9 +59,17 @@ LOGGER = logging.getLogger("train")
 # quantization, GPUs, or anything you would search for.
 #
 # Single-GPU is the design, not a workaround: every VRAM figure, batch size and
-# gradient-accumulation setting here is sized for one 16 GB T4. Set explicitly
-# rather than left to chance, and only if the caller has not chosen already.
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+# gradient-accumulation setting here is sized for one 16 GB T4.
+#
+# NOT setdefault(): Kaggle already exports CUDA_VISIBLE_DEVICES="0,1", so
+# setdefault sees a value present and leaves it, and DataParallel engages
+# anyway. Narrow whatever list is there to its first entry instead -- that
+# honours an explicit choice of WHICH device while still guaranteeing one.
+_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+if _visible is None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+elif "," in _visible:
+    os.environ["CUDA_VISIBLE_DEVICES"] = _visible.split(",")[0].strip()
 
 REPO_URL = os.environ.get("STRUCTURED_EXTRACT_REPO", "https://github.com/2005-Aneeshdutt/structured-extract")
 
@@ -252,8 +260,25 @@ def assert_environment() -> dict[str, Any]:
         "capability": f"sm_{cap[0]}{cap[1]}",
         "supports_bf16": supports_bf16,
         "torch": torch.__version__,
+        "visible_gpus": torch.cuda.device_count(),
     }
     LOGGER.info("environment: %s", info)
+
+    # Fail here, not 200 lines later inside torch's scatter_gather. With more
+    # than one visible device transformers.Trainer wraps the model in
+    # nn.DataParallel, which cannot replicate bitsandbytes 4-bit weights: the
+    # quantization state is not a scatterable tensor, and the failure surfaces
+    # as "chunk expects at least a 1-dimensional tensor" with no reference to
+    # quantization, DataParallel or GPU count.
+    if torch.cuda.device_count() > 1:
+        raise SystemExit(
+            f"{torch.cuda.device_count()} GPUs visible; this script is single-GPU "
+            "(every VRAM figure and batch size is sized for one 16 GB T4).\n"
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}\n"
+            "Fix:  CUDA_VISIBLE_DEVICES=0 python training/train.py ...\n"
+            "The module normally narrows this at import; if you are seeing this, "
+            "something set it after import."
+        )
     if props.total_memory / 1024**3 < 14:
         LOGGER.warning("less than 14 GB VRAM detected; reduce max_seq_length or batch size")
     return info
