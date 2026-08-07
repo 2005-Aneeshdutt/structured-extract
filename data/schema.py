@@ -642,19 +642,33 @@ def gemini_response_schema() -> dict[str, Any]:
     def s(t: str, **kw: Any) -> dict[str, Any]:
         return {"type": t, **kw}
 
+    # Every bound below mirrors a constraint the pydantic model already
+    # enforces. Where the two disagree, the grammar wins at generation time and
+    # pydantic wins at validation time -- so the model is free to emit something
+    # that is then thrown away, and the call is billed either way. Measured on a
+    # live run before these were added: 10.6% of postings failed, split between
+    # repetition loops with no legal stopping token and integers outside the
+    # validator's range.
+    #
+    # `maxLength` on strings is the counterpart to `maxItems` on arrays: without
+    # it a single string value is also an unbounded region the model can loop
+    # inside. Bounds are generous -- they exist to make runaway generation
+    # impossible, not to trim honest values.
+    TITLE, NAME, PLACE, TERM = 150, 150, 100, 40
+
     enum_of = lambda e: s("string", enum=[m.value for m in e], nullable=True)  # noqa: E731
 
     return s(
         "object",
         properties={
-            "job_title": s("string"),
-            "company_name": s("string", nullable=True),
+            "job_title": s("string", maxLength=TITLE),
+            "company_name": s("string", nullable=True, maxLength=NAME),
             "location": s(
                 "object",
                 properties={
-                    "city": s("string", nullable=True),
-                    "region": s("string", nullable=True),
-                    "country": s("string", nullable=True),
+                    "city": s("string", nullable=True, maxLength=PLACE),
+                    "region": s("string", nullable=True, maxLength=PLACE),
+                    "country": s("string", nullable=True, maxLength=PLACE),
                     "remote_policy": enum_of(RemotePolicy),
                 },
                 required=["city", "region", "country", "remote_policy"],
@@ -665,15 +679,20 @@ def gemini_response_schema() -> dict[str, Any]:
             "salary": s(
                 "object",
                 properties={
-                    "min_amount": s("number", nullable=True),
-                    "max_amount": s("number", nullable=True),
-                    "currency": s("string", nullable=True),
+                    # Mirrors _sane_magnitude's 0 < v < 1e9, which rejects both
+                    # "120" meaning 120k and a scraped epoch leaking into the field.
+                    "min_amount": s("number", nullable=True, minimum=1, maximum=999_999_999),
+                    "max_amount": s("number", nullable=True, minimum=1, maximum=999_999_999),
+                    "currency": s("string", nullable=True, maxLength=3),
                     "period": enum_of(PayPeriod),
                 },
                 required=["min_amount", "max_amount", "currency", "period"],
             ),
-            "years_experience_min": s("integer", nullable=True),
-            "application_deadline": s("string", nullable=True),
+            # Mirrors the field's ge=0, le=50. Without these the grammar admits
+            # any integer and pydantic then rejects it, which bills a call to
+            # produce a label that is discarded.
+            "years_experience_min": s("integer", nullable=True, minimum=0, maximum=50),
+            "application_deadline": s("string", nullable=True, maxLength=10),
             # maxItems is load-bearing, not documentation. Without it the
             # grammar permits an unbounded array, so a model that slips into a
             # repetition loop has NO legal stopping token until it chooses to
@@ -687,9 +706,12 @@ def gemini_response_schema() -> dict[str, Any]:
             # only in prose the model never saw -- descriptions are not part of
             # this hand-built schema. Verified enforced by the provider:
             # finish_reason went length -> stop, 8192 -> 388 completion tokens.
-            "required_skills": s("array", items=s("string"), maxItems=15),
-            "preferred_skills": s("array", items=s("string"), maxItems=10),
-            "benefits": s("array", items=s("string"), maxItems=10),
+            # Item maxLength matches canonicalize_terms, which already drops any
+            # term over 40 chars -- so the grammar now refuses to generate what
+            # the validator would silently discard.
+            "required_skills": s("array", items=s("string", maxLength=TERM), maxItems=15),
+            "preferred_skills": s("array", items=s("string", maxLength=TERM), maxItems=10),
+            "benefits": s("array", items=s("string", maxLength=TERM), maxItems=10),
         },
         required=list(JobPosting.model_fields.keys()),
         # propertyOrdering pins generation order to our canonical field order so
@@ -740,13 +762,15 @@ def _strict_json_schema(node: dict[str, Any]) -> dict[str, Any]:
         out["additionalProperties"] = False
     elif node_type == "array":
         out["items"] = _strict_json_schema(node["items"])
-        # Carried across deliberately: this is the keyword that bounds a
-        # repetition loop, so dropping it in translation would leave the
-        # OpenRouter path exposed to the failure the Gemini path is protected
-        # from -- and the symptom (a 23KB reply of one repeated word) looks
-        # nothing like a schema-translation bug.
-        if "maxItems" in node:
-            out["maxItems"] = node["maxItems"]
+
+    # Copied by name rather than dropped. These are the keywords that bound
+    # runaway generation and keep the grammar in step with pydantic; losing them
+    # in translation would leave the OpenRouter path exposed to a failure the
+    # Gemini path is protected from, and the symptom (a 23KB reply of one
+    # repeated word) looks nothing like a schema-translation bug.
+    for keyword in ("maxItems", "maxLength", "minimum", "maximum"):
+        if keyword in node:
+            out[keyword] = node[keyword]
 
     return out
 

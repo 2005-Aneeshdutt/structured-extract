@@ -193,6 +193,42 @@ class TestOpenAISchemaTranslation:
         assert props["required_skills"]["maxItems"] == 15
         assert props["benefits"]["maxItems"] == 10
 
+    def test_schema_bounds_match_the_pydantic_validators(self):
+        """The grammar must not permit what the validator will reject.
+
+        Where they disagree the model generates freely, pydantic throws the
+        result away, and the call is billed anyway. Measured before these bounds
+        existed: 10.6% of postings failed on exactly this mismatch.
+        """
+        props = self._schema()["properties"]
+        # JobPosting.years_experience_min is ge=0, le=50
+        assert props["years_experience_min"]["minimum"] == 0
+        assert props["years_experience_min"]["maximum"] == 50
+        # Salary._sane_magnitude requires 0 < v < 1e9
+        sal = props["salary"]["properties"]
+        assert sal["min_amount"]["minimum"] >= 1
+        assert sal["min_amount"]["maximum"] <= 1_000_000_000
+        # canonicalize_terms drops any term longer than 40 chars
+        assert props["required_skills"]["items"]["maxLength"] == 40
+
+    def test_every_string_field_is_length_bounded(self):
+        """An unbounded string is a region the model can loop inside forever.
+
+        maxItems closed the array case; a repetition inside a single string
+        value is the same failure one layer down.
+        """
+        def check(node: dict, path: str = "$") -> None:
+            types = node["type"] if isinstance(node["type"], list) else [node["type"]]
+            if "object" in types:
+                for k, v in node["properties"].items():
+                    check(v, f"{path}.{k}")
+            elif "array" in types:
+                check(node["items"], f"{path}[]")
+            elif "string" in types and "enum" not in node:
+                assert "maxLength" in node, f"{path} is an unbounded string"
+
+        check(self._schema())
+
     def test_nested_objects_are_translated_too(self):
         loc = self._schema()["properties"]["location"]
         assert loc["additionalProperties"] is False
