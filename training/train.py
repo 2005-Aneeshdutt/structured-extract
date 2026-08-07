@@ -203,10 +203,16 @@ class TrainConfig:
     @classmethod
     def from_json(cls, path: Path) -> TrainConfig:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        known = set(cls.__dataclass_fields__)
-        unknown = set(data) - known
-        if unknown:  # fail loudly: a typo'd key silently using the default is how
-            raise ValueError(f"unknown config keys: {sorted(unknown)}")  # ablations become nonsense
+        # JSON has no comment syntax, and these configs carry a "_comment" field
+        # explaining what the arm is for. Underscore-prefixed keys are therefore
+        # documentation, not settings, and are dropped before validation.
+        # Everything else still has to be a real field: a typo'd key silently
+        # falling back to a default is how a rank ablation quietly becomes three
+        # runs of the same configuration.
+        data = {k: v for k, v in data.items() if not k.startswith("_")}
+        unknown = set(data) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"unknown config keys: {sorted(unknown)}")
         if "target_modules" in data:
             data["target_modules"] = tuple(data["target_modules"])
         return cls(**data)
