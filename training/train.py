@@ -589,6 +589,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, default=None, help="path to a configs/*.json")
     ap.add_argument("--lora-rank", type=int, default=None, help="override the config's rank (ablation shortcut)")
+    ap.add_argument("--num-train-epochs", type=float, default=None,
+                    help="override the config's epoch count")
     ap.add_argument("--dataset-path", default=None)
     ap.add_argument("--output-dir", default=None)
     ap.add_argument("--hub-model-id", default=None, help="push the final adapter here, e.g. user/qwen-jobs-r16")
@@ -602,6 +604,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = TrainConfig.from_json(args.config) if args.config else TrainConfig()
     for attr, val in (("lora_rank", args.lora_rank), ("dataset_path", args.dataset_path),
                       ("output_dir", args.output_dir), ("hub_model_id", args.hub_model_id),
+                      ("num_train_epochs", args.num_train_epochs),
                       ("wandb_project", args.wandb_project), ("max_train_samples", args.max_train_samples)):
         if val is not None:
             setattr(cfg, attr, val)
@@ -732,6 +735,19 @@ def main(argv: list[str] | None = None) -> int:
         gradient_checkpointing=(backend == "peft"),  # unsloth handles its own
         group_by_length=True,   # ~20% fewer padding tokens on this length spread
         dataloader_num_workers=2,
+        # Upload at every checkpoint, not only at the end.
+        #
+        # A finished run whose artifact never left the box is a failed run. On a
+        # 6-hour Kaggle session the adapter existed on local disk for the whole
+        # run and was lost when the session was reclaimed before the manual push
+        # -- the training was fine, the transfer was the single point of
+        # failure. Pushing every save_steps means the worst case is losing the
+        # last 100 steps, not all of them, and it costs one ~70 MB upload per
+        # checkpoint.
+        push_to_hub=bool(cfg.hub_model_id),
+        hub_model_id=cfg.hub_model_id,
+        hub_strategy="every_save" if cfg.hub_model_id else "end",
+        hub_private_repo=False,
     )
 
     # packing=False: packing would raise throughput ~30% by concatenating short
