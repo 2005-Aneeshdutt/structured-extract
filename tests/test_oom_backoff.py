@@ -1,4 +1,4 @@
-"""OOM must degrade the batch size, never the reported score.
+﻿"""OOM must degrade the batch size, never the reported score.
 
 Batches are length-sorted, so the examples that exhaust memory are the LONGEST
 ones. Recording them as empty completions -- the correct handling for an API
@@ -10,7 +10,9 @@ of examples, all long, generated nothing.
 
 from __future__ import annotations
 
-from eval.run_eval import _generate_chunk, _is_oom
+import pytest
+
+from eval.run_eval import _generate_chunk, _is_oom, assert_generation_sane
 
 
 class _OomError(RuntimeError):
@@ -39,6 +41,45 @@ class FakeBackend:
 
 def _chunk(n: int) -> list[dict]:
     return [{"posting_id": f"p{i}", "source_text": f"t{i}"} for i in range(n)]
+
+
+class TestEmptyArmGuard:
+    """A broken machine must not be reported as a model score.
+
+    Twice this harness produced a believable headline number from a broken GPU
+    state -- 55% when batches were OOM-dropped, 48.6% when generation returned
+    instantly with empty strings and raised nothing. The model was fine both
+    times. What separates the two cases is not the value but the SHAPE: no
+    forward pass means empty output in ~0 seconds.
+    """
+
+    def test_healthy_run_passes(self):
+        assert_generation_sane("ok", [("{...}", 6.0)] * 100)
+
+    def test_mostly_instant_empties_aborts(self):
+        comps = [("", 0.0)] * 60 + [("{...}", 6.0)] * 40
+        with pytest.raises(SystemExit, match="ABORTING"):
+            assert_generation_sane("broken", comps)
+
+    def test_a_few_empties_are_tolerated(self):
+        """Some postings genuinely defeat a model; that is a score, not a fault."""
+        comps = [("", 0.0)] * 5 + [("{...}", 6.0)] * 95
+        assert_generation_sane("ok", comps)
+
+    def test_slow_empties_are_not_flagged(self):
+        """Empty after real compute is a model failure and must still be scored.
+
+        A model that burns its whole budget and emits nothing has genuinely
+        failed the example. Only INSTANT empties indicate no forward pass.
+        """
+        assert_generation_sane("weak-model", [("", 8.0)] * 100)
+
+    def test_verbose_garbage_is_not_flagged(self):
+        """A model emitting prose instead of JSON is non-compliant, not broken."""
+        assert_generation_sane("chatty", [("Sure! Here is the JSON:", 7.0)] * 100)
+
+    def test_empty_input_does_not_raise(self):
+        assert_generation_sane("nothing", [])
 
 
 class TestOomClassification:

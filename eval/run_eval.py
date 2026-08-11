@@ -400,6 +400,61 @@ def _generate_chunk(
                            size, cap[0])
 
 
+#: An arm that produces this fraction of *instant, empty* completions is
+#: reporting the machine's state, not the model's accuracy.
+EMPTY_ARM_THRESHOLD = 0.10
+INSTANT_SECONDS = 0.05
+
+
+def assert_generation_sane(name: str, completions: list[tuple[str, float]]) -> None:
+    """Refuse to score a run that clearly did not generate. Raises SystemExit.
+
+    Why a hard stop rather than a warning
+    -------------------------------------
+    This harness has now twice produced a plausible-looking headline number out
+    of a broken machine state: 55% compliance when batches were silently
+    OOM-dropped, and 48.6% when generation returned instantly with empty strings
+    and raised nothing at all. Both times the model was fine -- re-running the
+    same examples afterwards produced valid JSON for every one of them. Both
+    numbers were within the range a mediocre model might genuinely score, so
+    nothing about the value itself looked wrong, and either could have been
+    written into the README as a result.
+
+    What distinguishes a broken run from a bad model is not the score, it is the
+    SHAPE: a model that fails a hard example still spends time on it and still
+    emits tokens. Empty output returned in ~0 seconds means no forward pass
+    happened. That is the signal checked here.
+
+    A genuinely weak model emitting prose instead of JSON is untouched by this:
+    its completions are non-empty and slow, and it is scored as non-compliant,
+    which is the correct outcome.
+    """
+    if not completions:
+        return
+    instant_empty = sum(1 for text, dt in completions
+                        if not text.strip() and dt < INSTANT_SECONDS)
+    share = instant_empty / len(completions)
+    if share <= EMPTY_ARM_THRESHOLD:
+        if instant_empty:
+            LOGGER.warning("%d/%d completions were empty and instant (%.1f%%) -- below the "
+                           "%.0f%% abort threshold, but worth a look",
+                           instant_empty, len(completions), 100 * share,
+                           100 * EMPTY_ARM_THRESHOLD)
+        return
+    raise SystemExit(
+        f"\nABORTING {name}: {instant_empty}/{len(completions)} completions "
+        f"({share:.1%}) were empty AND returned in under {INSTANT_SECONDS}s.\n"
+        "No forward pass happened for those examples, so any score computed here "
+        "would describe this machine, not the model.\n\n"
+        "Usual cause: another process still holds VRAM, leaving the GPU in a state "
+        "where generate() returns nothing without raising.\n"
+        "  1. close other GPU users, then confirm the memory is actually free:\n"
+        "       nvidia-smi\n"
+        "  2. re-run this arm\n"
+        "If it recurs on a genuinely idle GPU, lower --batch-size."
+    )
+
+
 def run(backend: Backend, examples: list[dict[str, Any]], few_shot: list[tuple[str, str]],
         limit: int | None = None) -> dict[str, Any]:
     """Generate + score. Returns a payload safe to cache to disk and re-score."""
@@ -412,6 +467,7 @@ def run(backend: Backend, examples: list[dict[str, Any]], few_shot: list[tuple[s
     raw_rows: list[dict[str, Any]] = []
 
     completions = generate_completions(backend, examples, few_shot)
+    assert_generation_sane(backend.name, completions)
     for i, (ex, (out, dt)) in enumerate(zip(examples, completions, strict=True), 1):
         res = score_example(ex["posting_id"], ex["source_text"], ex["target_json"], out, latency_s=dt)
         results.append(res)
