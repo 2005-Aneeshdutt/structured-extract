@@ -35,11 +35,29 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol
+
+# Set before torch initializes CUDA, or it has no effect.
+#
+# A long generation run allocates blocks of constantly varying size -- every
+# batch has a different padded length -- and the default caching allocator
+# cannot reuse a cached 900 MB block to serve a 950 MB request. The free memory
+# is there, in pieces too small to use. Measured: an arm ran cleanly for 335 of
+# 500 examples, then OOM'd at batch 7 (a ~7,600-token batch that calibration had
+# shown fitting in ~3.3 GB), backed off to 3, then 1, and finally could not
+# allocate even a single sequence -- so the last third of the split was recorded
+# as empty completions.
+#
+# expandable_segments lets the allocator grow a segment in place instead of
+# demanding one contiguous block up front, which is the standard remedy for
+# exactly this pattern. Calibration never saw it because each measurement reset
+# the allocator first; fragmentation only accumulates over a real run.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from data.schema import (
     MAX_SOURCE_CHARS,
@@ -316,6 +334,7 @@ def generate_completions(
     order = sorted(range(len(examples)), key=lambda i: len(examples[i]["source_text"]))
     outs_by_index: dict[int, tuple[str, float]] = {}
     cap = [batch_size]
+    _SINGLE_OOMS.clear()
     groups = _token_budget_batches(examples, order, batch_size)
     if not quiet:
         sizes = [len(g) for g in groups]
@@ -331,6 +350,13 @@ def generate_completions(
         for i, text in zip(idxs, texts, strict=True):
             outs_by_index[i] = (text, dt)
         done += len(idxs)
+        # Release cached blocks between batches. Each batch has a different
+        # padded length, so blocks cached from the previous shape are usually
+        # the wrong size for the next one -- they occupy memory the allocator
+        # cannot reuse. Cheap relative to a 10-second generation, and it is what
+        # keeps a 500-example run from fragmenting itself into an OOM two thirds
+        # of the way through.
+        _free_cuda()
         if not quiet:
             LOGGER.info("%d/%d | %.1fs/example | batch %d", done, len(order), dt, len(idxs))
     return [outs_by_index[i] for i in range(len(examples))]
@@ -362,7 +388,13 @@ def generate_completions(
 #: the attention score matrix dominates; the measurements say it does not (batch
 #: 1 at 3,554 chars used 1,445 MiB where the quadratic fit predicted 3,360), and
 #: it overshot by 20x, which is what pinned the card at 3,953 of 4,096 MiB.
-BATCH_TOKEN_BUDGET = 11_000
+#: Set to 8,000 rather than the ~11,800 the calibration allows, because
+#: calibration reset the allocator before each measurement and a real run does
+#: not. The first run at 11,000 survived 335 of 500 examples before
+#: fragmentation turned a batch the card could hold into an OOM it could not
+#: recover from. The margin buys headroom for that; expandable_segments above
+#: attacks the cause.
+BATCH_TOKEN_BUDGET = 8_000
 
 #: Characters per token for this tokenizer on this corpus. Measured over the
 #: cleaned corpus with the Qwen2.5 tokenizer: 1,080 tokens for ~4,300 characters
@@ -420,6 +452,11 @@ def _token_budget_batches(
     if current:
         groups.append(current)
     return groups
+
+
+#: Posting ids that OOM'd even alone. Reset per run by generate_completions --
+#: a scattered failure is a hard document, three in a row is a dead card.
+_SINGLE_OOMS: list[str] = []
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -501,8 +538,21 @@ def _generate_chunk(
                 return [""] * len(chunk)
             _free_cuda()
             if size <= 1:
-                # One example alone does not fit. Genuinely unservable on this
-                # card; report it rather than pretending otherwise.
+                # A single example that will not fit is genuinely unservable on
+                # this card. But when EVERY example stops fitting, the card is
+                # exhausted, not the documents -- and grinding out hundreds of
+                # empty records before the end-of-run guard notices wastes the
+                # rest of the run. Measured: 165 of 500 examples recorded empty
+                # this way, over 30 minutes, after the allocator gave up.
+                _SINGLE_OOMS.append(chunk[0]["posting_id"])
+                if len(_SINGLE_OOMS) >= 3:
+                    raise SystemExit(
+                        f"\nABORTING: {len(_SINGLE_OOMS)} consecutive examples failed to "
+                        "generate even one at a time.\n"
+                        "The GPU cannot serve a single sequence, so every remaining result "
+                        "would be an empty completion.\n"
+                        "Fix: lower BATCH_TOKEN_BUDGET, or close other GPU users and re-run."
+                    ) from e
                 LOGGER.warning("OOM at batch size 1 near %s; recording empty",
                                chunk[0]["posting_id"])
                 return [""] * len(chunk)
