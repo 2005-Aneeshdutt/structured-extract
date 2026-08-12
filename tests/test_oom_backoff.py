@@ -13,7 +13,9 @@ from __future__ import annotations
 import pytest
 
 from eval.run_eval import (
-    BATCH_COST_BUDGET,
+    BATCH_TOKEN_BUDGET,
+    CHARS_PER_TOKEN,
+    MAX_NEW_TOKENS,
     _generate_chunk,
     _is_oom,
     _token_budget_batches,
@@ -102,24 +104,31 @@ class TestTokenBudgetBatching:
     def _ex(self, lengths):
         return [{"posting_id": f"p{i}", "source_text": "x" * n} for i, n in enumerate(lengths)]
 
-    def test_long_documents_get_small_batches(self):
-        ex = self._ex([4000] * 8)
-        order = list(range(len(ex)))
-        groups = _token_budget_batches(ex, order, max_size=8)
-        assert all(len(g) <= 8 for g in groups)
+    def test_long_documents_get_smaller_batches_than_short_ones(self):
+        """The whole point: batch size must fall as documents grow."""
+        long_groups = _token_budget_batches(self._ex([12000] * 16), list(range(16)), max_size=16)
+        short_groups = _token_budget_batches(self._ex([400] * 16), list(range(16)), max_size=16)
+        assert max(len(g) for g in long_groups) < max(len(g) for g in short_groups)
 
-    def test_short_documents_get_large_batches(self):
+    def test_short_documents_reach_the_count_cap(self):
         ex = self._ex([400] * 32)
         groups = _token_budget_batches(ex, list(range(len(ex))), max_size=8)
         assert max(len(g) for g in groups) == 8, "short docs should reach the count cap"
 
     def test_peak_cost_is_bounded_across_mixed_lengths(self):
-        """The invariant that matters: longest x count stays under budget."""
+        """The invariant that matters: reserved KV tokens stay under budget.
+
+        Cost includes MAX_NEW_TOKENS per sequence. The cache a sequence reserves
+        for output it has not generated yet is real memory, and on short prompts
+        it is most of the cost -- at 181 prompt tokens the 400 reserved for
+        generation are 69% of the total.
+        """
         ex = self._ex([300, 500, 900, 1200, 2000, 3400, 6000, 13000])
         order = sorted(range(len(ex)), key=lambda i: len(ex[i]["source_text"]))
         for g in _token_budget_batches(ex, order, max_size=16):
             longest = max(len(ex[i]["source_text"]) for i in g)
-            assert len(g) == 1 or longest ** 2 * len(g) <= BATCH_COST_BUDGET
+            cost = len(g) * (longest / CHARS_PER_TOKEN + MAX_NEW_TOKENS)
+            assert len(g) == 1 or cost <= BATCH_TOKEN_BUDGET
 
     def test_every_example_appears_exactly_once(self):
         ex = self._ex([100, 5000, 300, 12000, 800, 60])
@@ -181,6 +190,8 @@ class TestBackoff:
         be = FakeBackend(limit=0)
         out = _generate_chunk(be, _chunk(1), [], [1])
         assert out == [""], "a genuine hardware limit is reportable, not silently dropped"
+
+
 
 
 

@@ -94,7 +94,7 @@ class HFBackend:
     """
 
     def __init__(self, adapter: str | None = None, model_id: str = BASE_MODEL,
-                 load_in_4bit: bool = True, batch_size: int = 8) -> None:
+                 load_in_4bit: bool = True, batch_size: int = 16) -> None:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -319,8 +319,8 @@ def generate_completions(
     groups = _token_budget_batches(examples, order, batch_size)
     if not quiet:
         sizes = [len(g) for g in groups]
-        LOGGER.info("token-budget batching: %d groups, sizes %d..%d (budget %d src chars)",
-                    len(groups), min(sizes), max(sizes), BATCH_COST_BUDGET)
+        LOGGER.info("token-budget batching: %d groups, sizes %d..%d (budget %d KV tokens)",
+                    len(groups), min(sizes), max(sizes), BATCH_TOKEN_BUDGET)
 
     done = 0
     for idxs in groups:
@@ -336,20 +336,39 @@ def generate_completions(
     return [outs_by_index[i] for i in range(len(examples))]
 
 
-#: Batch cost ceiling, in units of (source chars)^2.
+#: Maximum KV-cache tokens a single batch may reserve.
 #:
-#: SQUARED, because the dominant allocation during prefill is the attention
-#: score matrix -- batch x heads x seq x seq -- not the KV cache, which is only
-#: linear in sequence length. Budgeting linearly gets the shape of the problem
-#: wrong in both directions: it is far too strict on short documents (batches of
-#: 1-2 where 16 would fit comfortably) and still too loose on the long tail.
+#: Cost is `count x (prompt_tokens + MAX_NEW_TOKENS)`. Every sequence reserves
+#: cache for the tokens it will GENERATE as well as the ones it reads, and on
+#: short prompts that reservation dominates -- which is why a batch of 8 short
+#: postings and a batch of 4 long ones can cost nearly the same.
 #:
-#: Calibrated from measurement on this 4 GB card rather than derived: batch 8 at
-#: ~6,000 chars ran fine for hundreds of examples, so 8 x 6000^2 is a size known
-#: to work. The observed failure -- batch 8 at 13,654 chars -- scores 1.5e9,
-#: five times over, which is the run that consumed 23 minutes of CPU without
-#: finishing a batch.
-BATCH_COST_BUDGET = 8 * 6000 ** 2
+#: Measured on the target card (RTX 2050, 4 GB, 4-bit NF4 weights) rather than
+#: derived, after two wrong models. Peak reserved memory across three length
+#: pools x four batch sizes:
+#:
+#:     pool      b1                b2            b4            b8
+#:     short   1374 MiB  65.0 s  1476  32.2  1692  15.2  2091   8.8
+#:     median  1445      66.9    1718  36.3  2074  19.8  3142  13.0
+#:     long    1678      88.8    1904  42.2  2489  23.8  3733  14.1  <- 91%
+#:
+#: Fitting those: ~1,350 MiB of weights plus 0.126-0.179 MiB per token, stable
+#: across a 10x range of prompt length. Holding to 85% of 4 GB gives ~11,800
+#: tokens; 11,000 leaves margin for fragmentation.
+#:
+#: The two models this replaces were both wrong in instructive ways. Linear in
+#: CHARACTERS ignored the generation reservation and produced batches of 1.6 on
+#: average -- near single-stream, ~6 h per arm. Quadratic in characters assumed
+#: the attention score matrix dominates; the measurements say it does not (batch
+#: 1 at 3,554 chars used 1,445 MiB where the quadratic fit predicted 3,360), and
+#: it overshot by 20x, which is what pinned the card at 3,953 of 4,096 MiB.
+BATCH_TOKEN_BUDGET = 11_000
+
+#: Characters per token for this tokenizer on this corpus. Measured over the
+#: cleaned corpus with the Qwen2.5 tokenizer: 1,080 tokens for ~4,300 characters
+#: of rendered prompt. Only used to SIZE batches, so an approximation is fine --
+#: being wrong here costs throughput, never correctness.
+CHARS_PER_TOKEN = 4.0
 
 
 def _token_budget_batches(
@@ -375,15 +394,23 @@ def _token_budget_batches(
     pathological case simply never forms. `max_size` still caps the batch so a
     corpus of very short documents does not build an enormous one.
     """
+    def cost(longest_chars: int, count: int) -> float:
+        """KV-cache tokens this batch reserves.
+
+        Padding runs to the longest member, so every sequence is charged the
+        longest prompt; each also reserves MAX_NEW_TOKENS for its output. That
+        second term is why short-prompt batches are not free: at 181 prompt
+        tokens, the 400 reserved for generation are 69% of the cost.
+        """
+        return count * (longest_chars / CHARS_PER_TOKEN + MAX_NEW_TOKENS)
+
     groups: list[list[int]] = []
     current: list[int] = []
     longest = 0
     for i in order:
         n = len(examples[i]["source_text"])
         candidate_longest = max(longest, n)
-        # Cost model matches how padding actually works: every member is padded
-        # up to the longest, so the batch costs longest x count.
-        if current and (candidate_longest ** 2 * (len(current) + 1) > BATCH_COST_BUDGET
+        if current and (cost(candidate_longest, len(current) + 1) > BATCH_TOKEN_BUDGET
                         or len(current) >= max_size):
             groups.append(current)
             current, longest = [i], n
@@ -654,4 +681,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
 
