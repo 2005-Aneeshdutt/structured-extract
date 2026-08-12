@@ -1,4 +1,4 @@
-"""Evaluation harness: run one model over a split and score it.
+﻿"""Evaluation harness: run one model over a split and score it.
 
     # fine-tuned adapter, 4-bit, on the sacred test split
     python -m eval.run_eval --backend hf --adapter outputs/qwen2.5-1.5b-r16-a32/adapter \
@@ -305,7 +305,7 @@ def generate_completions(
     """
     batch_size = getattr(backend, "batch_size", 1) if hasattr(backend, BATCH_CAPABLE) else 1
     if batch_size > 1 and not quiet:
-        LOGGER.info("batched generation, batch_size=%d — reported latency is amortized "
+        LOGGER.info("batched generation, batch_size=%d â€” reported latency is amortized "
                     "per-example throughput, NOT single-request latency", batch_size)
 
     # Length-sorted batching. Padding is to the longest member of each batch, so a
@@ -315,22 +315,84 @@ def generate_completions(
     # dataset order.
     order = sorted(range(len(examples)), key=lambda i: len(examples[i]["source_text"]))
     outs_by_index: dict[int, tuple[str, float]] = {}
-    # Shrinks on OOM and never grows back. Because `order` is ascending by
-    # length, a size that just exhausted memory will exhaust it again on every
-    # later batch; retrying at the old size each time would pay the OOM, the
-    # cache flush and the retry once per batch for the rest of the run.
     cap = [batch_size]
-    for start in range(0, len(order), batch_size):
-        idxs = order[start : start + batch_size]
+    groups = _token_budget_batches(examples, order, batch_size)
+    if not quiet:
+        sizes = [len(g) for g in groups]
+        LOGGER.info("token-budget batching: %d groups, sizes %d..%d (budget %d src chars)",
+                    len(groups), min(sizes), max(sizes), BATCH_COST_BUDGET)
+
+    done = 0
+    for idxs in groups:
         chunk = [examples[i] for i in idxs]
         t0 = time.perf_counter()
         texts = _generate_chunk(backend, chunk, few_shot, cap)
         dt = (time.perf_counter() - t0) / max(len(chunk), 1)
         for i, text in zip(idxs, texts, strict=True):
             outs_by_index[i] = (text, dt)
+        done += len(idxs)
         if not quiet:
-            LOGGER.info("%d/%d | %.1fs/example", min(start + batch_size, len(order)), len(order), dt)
+            LOGGER.info("%d/%d | %.1fs/example | batch %d", done, len(order), dt, len(idxs))
     return [outs_by_index[i] for i in range(len(examples))]
+
+
+#: Batch cost ceiling, in units of (source chars)^2.
+#:
+#: SQUARED, because the dominant allocation during prefill is the attention
+#: score matrix -- batch x heads x seq x seq -- not the KV cache, which is only
+#: linear in sequence length. Budgeting linearly gets the shape of the problem
+#: wrong in both directions: it is far too strict on short documents (batches of
+#: 1-2 where 16 would fit comfortably) and still too loose on the long tail.
+#:
+#: Calibrated from measurement on this 4 GB card rather than derived: batch 8 at
+#: ~6,000 chars ran fine for hundreds of examples, so 8 x 6000^2 is a size known
+#: to work. The observed failure -- batch 8 at 13,654 chars -- scores 1.5e9,
+#: five times over, which is the run that consumed 23 minutes of CPU without
+#: finishing a batch.
+BATCH_COST_BUDGET = 8 * 6000 ** 2
+
+
+def _token_budget_batches(
+    examples: list[dict[str, Any]], order: list[int], max_size: int
+) -> list[list[int]]:
+    """Group length-sorted indices so each batch costs about the same memory.
+
+    A fixed batch COUNT is the wrong unit. Padding runs to the longest member, so
+    a batch of 8 short postings (~500 tokens each) and a batch of 8 long ones
+    (~3,400 each) differ by ~7x in KV-cache footprint while looking identical in
+    the code. Sorted ascending, that means the run gets steadily heavier and the
+    last batches are the ones that do not fit.
+
+    On Linux that surfaces as a clean OOM the caller can back off from. On
+    Windows it does not: WDDM lets CUDA spill into system RAM rather than
+    failing, so nothing raises. Measured here -- the 8 longest examples at batch
+    size 8 consumed 23 minutes of CPU without completing a single batch, and
+    later degraded to returning empty completions instantly. Every OOM handler
+    in this file was waiting for an exception the platform never delivers.
+
+    Budgeting by (longest x count) keeps peak memory roughly flat across the
+    whole run: short groups come out large, long groups come out small, and the
+    pathological case simply never forms. `max_size` still caps the batch so a
+    corpus of very short documents does not build an enormous one.
+    """
+    groups: list[list[int]] = []
+    current: list[int] = []
+    longest = 0
+    for i in order:
+        n = len(examples[i]["source_text"])
+        candidate_longest = max(longest, n)
+        # Cost model matches how padding actually works: every member is padded
+        # up to the longest, so the batch costs longest x count.
+        if current and (candidate_longest ** 2 * (len(current) + 1) > BATCH_COST_BUDGET
+                        or len(current) >= max_size):
+            groups.append(current)
+            current, longest = [i], n
+        else:
+            current.append(i)
+            longest = candidate_longest
+    if current:
+        groups.append(current)
+    return groups
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -373,6 +435,7 @@ def _generate_chunk(
     So: halve and retry. Only a single example that still cannot fit is recorded
     as empty, and that is a genuine, reportable limit rather than an artifact.
     """
+    retried_empty = False
     while True:
         size = max(1, min(cap[0], len(chunk)))
         try:
@@ -383,6 +446,27 @@ def _generate_chunk(
                     texts.extend(backend.generate_batch([e["source_text"] for e in sub], few_shot))
                 else:
                     texts.append(backend.generate(sub[0]["source_text"], few_shot))
+
+            # An entire batch coming back empty is not a model result, it is the
+            # signature of a GPU that has stopped generating. Observed on this
+            # 4 GB card: ~280 examples into a length-sorted run, every remaining
+            # batch returned zero new tokens instantly and no exception was
+            # raised anywhere. The same examples generate correctly in a fresh
+            # process, so the cause is accumulated allocator state rather than
+            # anything about the inputs.
+            #
+            # Handled like an OOM because the remedy is the same: free the cache,
+            # come back smaller. Retried at most once per chunk, so a model that
+            # genuinely produces nothing for one hard batch is still scored as
+            # having produced nothing.
+            if texts and not any(t.strip() for t in texts) and not retried_empty:
+                retried_empty = True
+                _free_cuda()
+                if size > 1:
+                    cap[0] = max(1, size // 2)
+                LOGGER.warning("whole batch of %d empty near %s; cleared CUDA cache, "
+                               "retrying at %d", len(texts), chunk[0]["posting_id"], cap[0])
+                continue
             return texts
         except Exception as e:
             if not _is_oom(e):
@@ -570,3 +654,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

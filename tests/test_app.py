@@ -60,11 +60,36 @@ class TestGuards:
         assert not demo_app._MODELS, "no model should be loaded for empty input"
 
     def test_unconfigured_repo_fails_with_a_readable_message(self, monkeypatch):
+        """Only meaningful on the GGUF path -- FT_REPO names a GGUF repo.
+
+        The transformers fallback reads ADAPTER_REPO instead, so firing this
+        guard there would block a correctly-configured machine that simply has
+        no llama.cpp. Forced on so the message is tested wherever the suite runs.
+        """
+        monkeypatch.setattr(demo_app, "_have_llama_cpp", lambda: True)
         monkeypatch.setattr(demo_app, "FINETUNED_REPO", "SET_HF_USER/whatever")
         _out, status, _raw = demo_app.extract("Engineer at Acme", "Fine-tuned (LoRA r=16)")
         assert "Configuration needed" in status
         assert "FT_REPO" in status
         assert not demo_app._MODELS
+
+    def test_fallback_path_is_not_blocked_by_the_gguf_guard(self, monkeypatch):
+        """Without llama.cpp the GGUF repo id is irrelevant and must not gate."""
+        monkeypatch.setattr(demo_app, "_have_llama_cpp", lambda: False)
+        monkeypatch.setattr(demo_app, "FINETUNED_REPO", "SET_HF_USER/whatever")
+        called = {}
+        monkeypatch.setattr(demo_app, "_complete",
+                            lambda which, text: called.setdefault("which", which) or '{"job_title":"x"}')
+        _out, status, _raw = demo_app.extract("Engineer at Acme", "Fine-tuned (LoRA r=16)")
+        assert "Configuration needed" not in status
+        assert called["which"] == "finetuned"
+
+    def test_runtime_label_names_what_served_the_request(self, monkeypatch):
+        """The two runtimes are not numerically identical, so the UI says which."""
+        monkeypatch.setattr(demo_app, "_have_llama_cpp", lambda: True)
+        assert "GGUF" in demo_app.runtime_label()
+        monkeypatch.setattr(demo_app, "_have_llama_cpp", lambda: False)
+        assert "adapter" in demo_app.runtime_label()
 
 
 def test_app_uses_the_shared_schema_not_a_copy():

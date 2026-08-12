@@ -12,7 +12,13 @@ from __future__ import annotations
 
 import pytest
 
-from eval.run_eval import _generate_chunk, _is_oom, assert_generation_sane
+from eval.run_eval import (
+    BATCH_COST_BUDGET,
+    _generate_chunk,
+    _is_oom,
+    _token_budget_batches,
+    assert_generation_sane,
+)
 
 
 class _OomError(RuntimeError):
@@ -82,6 +88,52 @@ class TestEmptyArmGuard:
         assert_generation_sane("nothing", [])
 
 
+class TestTokenBudgetBatching:
+    """Batch by memory cost, not by example count.
+
+    Padding runs to the longest member, so a batch of 8 short postings and a
+    batch of 8 long ones differ by ~7x in KV-cache footprint while looking
+    identical in code. Sorted ascending, the run gets steadily heavier and the
+    final batches are the ones that do not fit -- measured here as 23 minutes of
+    CPU on a single batch that never completed, because Windows spills VRAM to
+    system RAM instead of raising OOM.
+    """
+
+    def _ex(self, lengths):
+        return [{"posting_id": f"p{i}", "source_text": "x" * n} for i, n in enumerate(lengths)]
+
+    def test_long_documents_get_small_batches(self):
+        ex = self._ex([4000] * 8)
+        order = list(range(len(ex)))
+        groups = _token_budget_batches(ex, order, max_size=8)
+        assert all(len(g) <= 8 for g in groups)
+
+    def test_short_documents_get_large_batches(self):
+        ex = self._ex([400] * 32)
+        groups = _token_budget_batches(ex, list(range(len(ex))), max_size=8)
+        assert max(len(g) for g in groups) == 8, "short docs should reach the count cap"
+
+    def test_peak_cost_is_bounded_across_mixed_lengths(self):
+        """The invariant that matters: longest x count stays under budget."""
+        ex = self._ex([300, 500, 900, 1200, 2000, 3400, 6000, 13000])
+        order = sorted(range(len(ex)), key=lambda i: len(ex[i]["source_text"]))
+        for g in _token_budget_batches(ex, order, max_size=16):
+            longest = max(len(ex[i]["source_text"]) for i in g)
+            assert len(g) == 1 or longest ** 2 * len(g) <= BATCH_COST_BUDGET
+
+    def test_every_example_appears_exactly_once(self):
+        ex = self._ex([100, 5000, 300, 12000, 800, 60])
+        order = sorted(range(len(ex)), key=lambda i: len(ex[i]["source_text"]))
+        got = [i for g in _token_budget_batches(ex, order, max_size=4) for i in g]
+        assert sorted(got) == sorted(order), "batching must not drop or duplicate examples"
+
+    def test_a_single_oversized_document_still_gets_its_own_batch(self):
+        """One document larger than the whole budget must not be skipped."""
+        ex = self._ex([50000])
+        groups = _token_budget_batches(ex, [0], max_size=8)
+        assert groups == [[0]]
+
+
 class TestOomClassification:
     def test_recognises_cuda_oom(self):
         assert _is_oom(RuntimeError("CUDA error: out of memory"))
@@ -129,3 +181,7 @@ class TestBackoff:
         be = FakeBackend(limit=0)
         out = _generate_chunk(be, _chunk(1), [], [1])
         assert out == [""], "a genuine hardware limit is reportable, not silently dropped"
+
+
+
+

@@ -29,3 +29,6 @@ wandb/
 # Results: charts + tables ARE committed (they are the point of the README).
 # Raw per-example prediction dumps are not.
 results/raw_predictions/
+
+# Claude Code local permissions (machine-specific, not for the repo)
+.claude/settings.local.json

@@ -58,6 +58,108 @@ _MODELS: dict[str, Any] = {}
 _LOCAL_DIR: Path | None = None
 
 
+#: Used by the transformers fallback only -- see `_complete`.
+ADAPTER_REPO = os.environ.get("ADAPTER_REPO", "STRAWBARREL/qwen2.5-1.5b-jobs-extract-r16")
+HF_BASE_MODEL = os.environ.get("HF_BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+
+
+def _launch_takes_css() -> bool:
+    """Does this Gradio expect `css` on launch() rather than on Blocks?"""
+    import inspect
+
+    return "css" in inspect.signature(gr.Blocks.launch).parameters
+
+
+def launch_kwargs() -> dict[str, Any]:
+    """Extra kwargs for demo.launch(), version-dependent."""
+    return {"css": CSS} if _launch_takes_css() else {}
+
+
+def _have_llama_cpp() -> bool:
+    """Is the GGUF runtime importable here? Any failure means 'no'."""
+    try:
+        import llama_cpp  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def runtime_label() -> str:
+    """What actually served the request. Shown in the UI, because the two
+    runtimes are not numerically identical and a visitor should know which
+    one produced the output they are looking at."""
+    return "Q4_K_M GGUF on CPU" if _have_llama_cpp() else "4-bit NF4 + LoRA adapter"
+
+
+def _load_hf(which: str):
+    """transformers + PEFT fallback: the same 4-bit path the evaluation uses.
+
+    Why this exists
+    ---------------
+    The GGUF is the artifact that ships, and llama.cpp is the right runtime for
+    it: CPU-only, one file, no framework. But llama-cpp-python publishes no
+    prebuilt wheel for every platform, and building from source needs a C++
+    toolchain -- which on Windows additionally hits the 260-character path limit
+    inside a venv nested under OneDrive. A demo that only runs where llama.cpp
+    compiles is a demo its author cannot run.
+
+    This path loads the adapter directly instead. It is NOT the shipping
+    artifact: 4-bit NF4 with an adapter attached is not the same arithmetic as a
+    merged Q4_K_M GGUF, which is precisely why the README reports the
+    quantization delta as a measured number rather than assuming it is zero.
+    The UI names whichever runtime served the request.
+    """
+    if which in _MODELS:
+        return _MODELS[which]
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    on_gpu = torch.cuda.is_available()
+    quant = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    ) if on_gpu else None
+
+    tok = AutoTokenizer.from_pretrained(ADAPTER_REPO if which == "finetuned" else HF_BASE_MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        HF_BASE_MODEL,
+        quantization_config=quant,
+        dtype=torch.float16 if on_gpu else torch.float32,
+        device_map="auto" if on_gpu else None,
+    )
+    if which == "finetuned":
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, ADAPTER_REPO)
+    model.eval()
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    _MODELS[which] = (model, tok)
+    return _MODELS[which]
+
+
+def _complete(which: str, posting_text: str) -> str:
+    """One greedy completion, through whichever runtime this machine has."""
+    messages = build_messages(posting_text)
+    if _have_llama_cpp():
+        resp = _load(which).create_chat_completion(
+            messages=messages, max_tokens=MAX_NEW_TOKENS, temperature=0.0
+        )
+        return resp["choices"][0]["message"]["content"] or ""
+
+    import torch
+
+    model, tok = _load_hf(which)
+    prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tok(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS,
+                             do_sample=False, pad_token_id=tok.pad_token_id)
+    return tok.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+
+
 def _load(which: str):
     """Lazily load and cache a llama.cpp model.
 
@@ -95,20 +197,16 @@ def extract(posting_text: str, model_choice: str) -> tuple[str, str, str]:
         return "{}", "Paste a job posting on the left, then press **Extract**.", ""
 
     which = "finetuned" if model_choice.startswith("Fine") else "base"
-    if which == "finetuned" and FINETUNED_REPO.startswith("SET_HF_USER"):
+    # Only the GGUF path needs FT_REPO; the transformers fallback reads
+    # ADAPTER_REPO instead, so this guard must not fire for it.
+    if which == "finetuned" and _have_llama_cpp() and FINETUNED_REPO.startswith("SET_HF_USER"):
         return ("{}", "**Configuration needed.** Set the `FT_REPO` environment variable to the "
                 "HuggingFace repo holding your GGUF (e.g. `yourname/qwen2.5-1.5b-jobs-extract-GGUF`), "
                 "or run with `--local models/`.", "")
-    llm = _load(which)
 
     t0 = time.perf_counter()
-    resp = llm.create_chat_completion(
-        messages=build_messages(posting_text),
-        max_tokens=MAX_NEW_TOKENS,
-        temperature=0.0,  # greedy, so the demo is reproducible for a visitor
-    )
+    raw = _complete(which, posting_text)
     elapsed = time.perf_counter() - t0
-    raw = resp["choices"][0]["message"]["content"] or ""
 
     obj, err = parse_prediction(raw)
     if obj is None:
@@ -126,7 +224,7 @@ def extract(posting_text: str, model_choice: str) -> tuple[str, str, str]:
     n_filled = sum(1 for v in obj.model_dump().values() if v not in (None, [], {}))
 
     status = [f"✅ **Valid JSON**, schema-conformant · {n_filled}/12 top-level fields populated",
-              f"⏱ {elapsed:.2f}s · model: `{model_choice}` · Q4_K_M GGUF on CPU"]
+              f"⏱ {elapsed:.2f}s · model: `{model_choice}` · {runtime_label()}"]
     if ungrounded:
         # The same grounding check used to compute the hallucination metric in
         # eval/. Surfacing it live is the point: it turns an abstract number in
@@ -471,7 +569,12 @@ def build_ui(default_model: str = "Fine-tuned (LoRA r=16)") -> gr.Blocks:
     #   * `show_copy_button=` on Textbox -- removed in Gradio 6.
     # Both were cosmetic; neither is worth a version pin that could leave the
     # Space and the local install on different majors.
-    with gr.Blocks(title="Structured Extraction — Qwen2.5-1.5B LoRA", css=CSS) as demo:
+    # Gradio 6 moved `css` from the Blocks constructor to launch(); 4.x and 5.x
+    # only accept it on Blocks. Passing it to the wrong one is not an error, it
+    # is silently ignored -- the page renders unstyled and nothing says why.
+    # Decide from the actual signature rather than from a version string.
+    blocks_kwargs = {} if _launch_takes_css() else {"css": CSS}
+    with gr.Blocks(title="Structured Extraction — Qwen2.5-1.5B LoRA", **blocks_kwargs) as demo:
         gr.HTML(HERO)
         with gr.Row():
             with gr.Column(scale=1, elem_classes="se-card"):
@@ -522,7 +625,8 @@ def main() -> None:
     args = ap.parse_args()
 
     _LOCAL_DIR = args.local
-    build_ui().launch(share=args.share, server_port=args.port, server_name="0.0.0.0")
+    build_ui().launch(share=args.share, server_port=args.port, server_name="0.0.0.0",
+                      **launch_kwargs())
 
 
 if __name__ == "__main__":
